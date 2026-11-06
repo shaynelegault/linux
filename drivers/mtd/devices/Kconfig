@@ -213,7 +213,7 @@ config MTD_APPLE_H2FMI
 	  Apple's flash controller as it appears on the A5 (S5L8940X/8942X),
 	  driving the Hynix PPN packages the iPad mini 1 boots iOS from.  The
 	  package does its own ECC, so this is a plain MTD and not a raw-NAND
-	  driver.  One MTD per die; four on this board.
+	  driver.  One MTD per CAU; geometry is read from each package.
 
 	  READ ONLY.  The driver's opcode allowlist contains no program and no
 	  erase, so it cannot damage whatever the NAND already holds -- which
@@ -223,6 +223,15 @@ config MTD_APPLE_H2FMI
 	  to mount iOS's own partitions.
 
 	  If unsure, say N.
+
+config MTD_APPLE_H2FMI_KUNIT_TEST
+	tristate "KUnit tests for Apple H2FMI PPN geometry" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test PPN parameter parsing, row encoding and page-status handling.
+	  Both measured PPN package profiles are covered.
+	  These tests use synthetic parameter pages and do not access hardware.
 
 if MTD_DOCG3
 config BCH_CONST_M
