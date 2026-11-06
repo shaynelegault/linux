@@ -22,3 +22,5 @@ obj-$(CONFIG_MTD_APPLE_H2FMI)	+= mtd-apple-h2fmi.o
 
 
 CFLAGS_docg3.o			+= -I$(src)
+
+obj-$(CONFIG_MTD_APPLE_H2FMI_KUNIT_TEST) += mtd-apple-h2fmi-test.o

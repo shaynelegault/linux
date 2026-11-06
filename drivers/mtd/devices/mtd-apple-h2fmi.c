@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple S5L H2FMI + Hynix PPN NAND -- READ ONLY.
+ * Apple S5L H2FMI + Hynix PPN NAND.
  *
  * The iPad mini 1 has two PPN packages, one on CE0 of each of the SoC's two
  * flash buses.  "PPN" means the package has its own controller: it does the
@@ -14,23 +14,22 @@
  * this is a port of, tools/nand/ppn.c, which read the whole NAND bit-for-bit
  * repeatably.  docs/research/p105-nand.md is the notebook.
  *
- * Geometry: 2 buses x 1 CE x 2 CAUs x 1064 blocks x 256 pages.  A page comes
- * off the bus as 16448 bytes -- four times (1024 data, 16 metadata, 3072
- * data).  The metadata is the FTL's, and becomes MTD's OOB; strip it and a
- * page is 16 KiB of data with 64 bytes of OOB.  One MTD is exported per die,
- * which is also how the verified raw dumps in docs are laid out, so a fresh
- * read can be diffed against them byte for byte.
+ * Geometry is read from each PPN package before registering any MTDs.
+ * The supported packages have one CE per bus and either two or eight CAUs.
+ * A page has 16448 bytes: four chunks of 1024 data bytes, 16 metadata
+ * bytes and 3072 more data bytes.  The metadata is the FTL's, and becomes MTD's OOB; strip it and a
+ * page is 16 KiB of data with 64 bytes of OOB. One MTD is exported per
+ * CAU. Raw MTD offsets are independent of the iOS logical block addresses.
  *
- * READ ONLY, and structurally so: the opcode allowlist below has no program
- * (80/10, PPN boot page 8A/17) and no erase (60/D0, PPN 67) in it, and there
- * is no code path that could issue one.  Writing is a separate job that costs
- * iOS the first time it runs; see the README.
+ * This interface exposes reads through MTD. Logical-address translation and
+ * allocation belong to the shared FTL above the physical page provider.
  */
 
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
 #include <linux/mtd/mtd.h>
@@ -38,31 +37,10 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 
+#include "mtd-apple-h2fmi.h"
+
 #define H2FMI_BUSES		2
-#define H2FMI_CAUS		2
-#define H2FMI_DIES		(H2FMI_BUSES * H2FMI_CAUS)
-#define H2FMI_BLOCKS		1064
-#define H2FMI_PAGES		256
-
-#define H2FMI_CHUNKS		4		/* per page */
-#define H2FMI_CHUNK_LO		1024		/* data before the metadata */
-#define H2FMI_CHUNK_META	16
-#define H2FMI_CHUNK_HI		3072		/* data after it */
-#define H2FMI_CHUNK_RAW		(H2FMI_CHUNK_LO + H2FMI_CHUNK_META + H2FMI_CHUNK_HI)
-
-#define H2FMI_PAGE_RAW		(H2FMI_CHUNKS * H2FMI_CHUNK_RAW)	/* 16448 */
-#define H2FMI_PAGE_DATA		(H2FMI_CHUNKS * (H2FMI_CHUNK_LO + H2FMI_CHUNK_HI))
-#define H2FMI_PAGE_OOB		(H2FMI_CHUNKS * H2FMI_CHUNK_META)	/* 64 */
-#define H2FMI_ERASESIZE		((u32)H2FMI_PAGES * H2FMI_PAGE_DATA)	/* 4 MiB */
-
-/* Data page and erase block are both powers of two (16 KiB and 4 MiB), so an
- * offset splits with shifts and masks.  This is a 32-bit kernel and the MTD is
- * 4 GiB, so every offset is 64-bit: a plain / or % here would be a link error
- * for __aeabi_uldivmod, which is exactly the kind of thing that only shows up
- * at the end of a build. */
-#define H2FMI_PAGE_SHIFT	14
-#define H2FMI_PAGES_SHIFT	8			/* 256 pages a block */
-#define H2FMI_PAGE_MASK		((u32)H2FMI_PAGE_DATA - 1)
+#define H2FMI_PAGE_MASK		(H2FMI_PAGE_DATA - 1)
 
 /* The ADT's ce-bitmap is 0x101: CE0 on each bus, and nothing else.  Addressing
  * a CE with no chip behind it wedges the FMC in DDR -- it waits for a DQS that
@@ -91,22 +69,11 @@
 #define FMC_NAND_STATUS		0x48
 #define FMC_STATUS_MASK		0x4c
 
-/* Page status: 0x40 good, 0x42 good but due a refresh, 0x45 every page of a
- * retired block, 0x49 erased. */
-#define PPN_ST_GOOD		0x40
-#define PPN_ST_REFRESH		0x42
-#define PPN_ST_RETIRED		0x45
-#define PPN_ST_ERASED		0x49
-
-/* row for the page-read command */
-#define PPN_ROW(cau, blk, pg) \
-	((u32)(pg) | (u32)(blk) << 8 | (u32)(cau) << 19)
-
 /* The allowlist is the safety property, not a convenience: a sequence that is
  * not on it does not run.  Nothing here programs or erases. */
 static const u8 h2fmi_read_only_ops[][2] = {
-	{ 0xff, 0x00 },		/* reset */
 	{ 0x70, 0x00 },		/* read status */
+	{ 0x92, 0x97 },		/* PPN device parameters */
 	{ 0x77, 0x7d },		/* PPN operation status */
 	{ 0x77, 0x00 },		/* PPN end of operation */
 	{ 0x7a, 0x00 },		/* PPN data out */
@@ -119,6 +86,8 @@ struct h2fmi_bus {
 	void __iomem *ecc;
 	struct mutex lock;	/* one command sequence on this bus at a time */
 	u8 *page;		/* one raw page; only touched under lock */
+	struct h2fmi_geometry geometry;
+	bool failed;		/* block further I/O in this driver instance */
 };
 
 struct h2fmi_die {
@@ -130,8 +99,9 @@ struct h2fmi_die {
 struct h2fmi {
 	struct device *dev;
 	struct h2fmi_bus bus[H2FMI_BUSES];
-	struct mtd_info mtd[H2FMI_DIES];
-	struct h2fmi_die die[H2FMI_DIES];
+	struct mtd_info *mtd;
+	struct h2fmi_die *die;
+	unsigned int ndies;
 };
 
 /*
@@ -156,7 +126,7 @@ static int h2fmi_wait(struct h2fmi *fmi, void __iomem *base, u32 off,
 
 /*
  * FMC_CMD holds the first command byte, and the second one in bits 15:8.
- * Every sequence goes through here, which is where the allowlist bites.
+ * Every command sequence passes through the read-operation allowlist.
  */
 static int h2fmi_cmd_write(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op, u8 op2)
 {
@@ -196,8 +166,11 @@ static int h2fmi_cmd1(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op)
 static int h2fmi_cmd_addr_cmd(struct h2fmi *fmi, struct h2fmi_bus *b,
 			      u8 op, u8 op2, u32 addr, int naddr)
 {
-	int ret = h2fmi_cmd_write(fmi, b, op, op2);
+	int ret;
 
+	if (naddr < 1 || naddr > sizeof(addr))
+		return -EINVAL;
+	ret = h2fmi_cmd_write(fmi, b, op, op2);
 	if (ret)
 		return ret;
 	writel(addr, b->fmc + FMC_ADDR0);
@@ -306,27 +279,61 @@ static void h2fmi_device_reset(struct h2fmi_bus *b, u32 on, u32 if_ctrl)
 	writel(if_ctrl, b->fmc + FMC_IF_CTRL);
 }
 
-/* One raw page, into b->page.  Caller holds b->lock. */
-static int h2fmi_read_raw_page(struct h2fmi *fmi, struct h2fmi_bus *b,
-			       u32 row, u8 *st)
+/* Caller holds b->lock. All exits release CE and restore inherited state. */
+static int h2fmi_read_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
+				  u8 op, u8 op2, u32 address, int naddr,
+				  u8 *buffer, u32 length, u8 *status)
 {
-	u32 on = readl(b->fmc + FMC_ON);
-	u32 if_ctrl = readl(b->fmc + FMC_IF_CTRL);
-	int ret;
+	u32 on, if_ctrl;
+	int ret, end_ret;
 
-	*st = 0;
+	*status = 0;
+	if (b->failed)
+		return -EIO;
+	on = readl(b->fmc + FMC_ON);
+	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
+	if (on != 5)
+		return -EIO;
+
 	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
 	h2fmi_clear_irqs(b);
-
-	ret = h2fmi_cmd_addr_cmd(fmi, b, 0x0a, 0x37, row, 3);
+	ret = h2fmi_cmd_addr_cmd(fmi, b, op, op2, address, naddr);
 	if (!ret)
-		ret = h2fmi_status(fmi, b, st);
-	if (!ret)
-		ret = h2fmi_data_out(fmi, b, b->page, H2FMI_PAGE_RAW);
+		ret = h2fmi_status(fmi, b, status);
+	/* An error status has no data phase. Device parameters require GOOD;
+	 * normal pages also admit REFRESH and ERASED. Keep the status for the
+	 * MTD reader and bad-block query without copying a stale page buffer.
+	 */
+	if (!ret && (op == 0x92 ? *status == PPN_ST_GOOD :
+		     h2fmi_page_status(*status) >= 0))
+		ret = h2fmi_data_out(fmi, b, buffer, length);
 
-	h2fmi_cmd1(fmi, b, 0x77);
+	/* Stop PIO before ending the operation, as in the parameter reader. */
+	writel(6, b->fmi + FMI_CONTROL);
+	end_ret = h2fmi_cmd1(fmi, b, 0x77);
 	writel(0, b->fmc + FMC_CE_CTRL);
 	h2fmi_device_reset(b, on, if_ctrl);
+	if (ret || end_ret) {
+		b->failed = true;
+		return ret ? ret : end_ret;
+	}
+	return 0;
+}
+
+static int h2fmi_read_geometry(struct h2fmi *fmi, struct h2fmi_bus *b)
+{
+	u8 status = 0;
+	int ret;
+
+	mutex_lock(&b->lock);
+	ret = h2fmi_read_transaction(fmi, b, 0x92, 0x97, 0, 1,
+				     b->page, H2FMI_PARAMS_SIZE, &status);
+	if (!ret && status != PPN_ST_GOOD)
+		ret = -EIO;
+	if (!ret)
+		ret = h2fmi_parse_geometry(b->page, H2FMI_PARAMS_SIZE,
+					   &b->geometry);
+	mutex_unlock(&b->lock);
 	return ret;
 }
 
@@ -353,14 +360,6 @@ static void h2fmi_split_page(const u8 *raw, u8 *data, u8 *oob)
 	}
 }
 
-/*
- * The one place that turns an MTD offset into a page and reads it.  Whole
- * pages are always read -- the PPN cannot hand over less than one -- and the
- * caller takes what it wants out of the bounce buffer.
- *
- * `from` must be page-aligned.  The page's status byte comes back in *stp; a
- * negative return means the bus failed, not that the data is bad.
- */
 static int h2fmi_read_page_at(struct mtd_info *mtd, loff_t from,
 			      u8 *data, u8 *oob, u8 *stp)
 {
@@ -368,18 +367,31 @@ static int h2fmi_read_page_at(struct mtd_info *mtd, loff_t from,
 	struct h2fmi *fmi = die->fmi;
 	struct h2fmi_bus *b = &fmi->bus[die->bus];
 	u64 page = (u64)from >> H2FMI_PAGE_SHIFT;
-	u32 blk = (u32)(page >> H2FMI_PAGES_SHIFT);
-	u32 pg = (u32)page & (H2FMI_PAGES - 1);
+	u32 blk = page >> b->geometry.page_bits;
+	u32 pg = page & (b->geometry.pages - 1);
+	u32 row;
 	u8 st = 0;
 	int ret;
 
-	if (blk >= H2FMI_BLOCKS)
+	if (from < 0 || from >= mtd->size || (from & H2FMI_PAGE_MASK))
 		return -EINVAL;
+	ret = h2fmi_page_row(&b->geometry, die->cau, blk, pg, &row);
+	if (ret)
+		return ret;
 
 	mutex_lock(&b->lock);
-	ret = h2fmi_read_raw_page(fmi, b, PPN_ROW(die->cau, blk, pg), &st);
-	if (!ret)
-		h2fmi_split_page(b->page, data, oob);
+	/* Supported PPN 1.5 packages require four row cycles, even when the
+	 * fourth byte is zero. This is independent of the geometry's width.
+	 */
+	ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row, 4,
+				     b->page, H2FMI_PAGE_RAW, &st);
+	if (!ret && h2fmi_page_status(st) >= 0) {
+		if (st == PPN_ST_ERASED &&
+		    memchr_inv(b->page, 0xff, H2FMI_PAGE_RAW))
+			ret = -EBADMSG;
+		else
+			h2fmi_split_page(b->page, data, oob);
+	}
 	mutex_unlock(&b->lock);
 
 	*stp = st;
@@ -398,17 +410,12 @@ static int h2fmi_read_page_at(struct mtd_info *mtd, loff_t from,
  */
 static int h2fmi_bitflips(struct mtd_info *mtd, u8 st)
 {
-	switch (st) {
-	case PPN_ST_GOOD:
-	case PPN_ST_ERASED:
-		return 0;
-	case PPN_ST_REFRESH:
-		return 1;
-	default:
+	int ret = h2fmi_page_status(st);
+
+	if (ret < 0)
 		dev_err_ratelimited(mtd->dev.parent,
 				    "%s: page status 0x%02x\n", mtd->name, st);
-		return -EBADMSG;
-	}
+	return ret;
 }
 
 /*
@@ -463,14 +470,22 @@ static int h2fmi_mtd_read_oob(struct mtd_info *mtd, loff_t from,
 		}
 
 		ret = h2fmi_read_page_at(mtd, base, dst, oob, &st);
-		if (ret)
+		if (ret) {
+			/* MEMREAD retries ECC errors. No bytes were returned, so
+			 * report a terminal error instead of repeating this page.
+			 */
+			if (ret == -EBADMSG)
+				ret = -EIO;
 			break;
+		}
 
 		bf = h2fmi_bitflips(mtd, st);
 		if (bf < 0) {
-			ret = bf;
+			mtd->ecc_stats.failed++;
+			ret = -EIO;
 			break;
 		}
+		mtd->ecc_stats.corrected += bf;
 		maxbitflips = max(maxbitflips, bf);
 
 		if (len) {
@@ -514,27 +529,20 @@ static int h2fmi_mtd_block_isbad(struct mtd_info *mtd, loff_t ofs)
 	ret = h2fmi_read_page_at(mtd, ofs, NULL, NULL, &st);
 	if (ret)
 		return ret;
-	switch (st) {
-	case PPN_ST_GOOD:
-	case PPN_ST_REFRESH:
-	case PPN_ST_ERASED:
-		return 0;
-	case PPN_ST_RETIRED:
+	if (st == PPN_ST_RETIRED)
 		return 1;
-	default:
-		/* An unknown status does not establish that the block is good. */
-		return -EIO;
-	}
+	return h2fmi_page_status(st) < 0 ? -EIO : 0;
 }
 
 static int h2fmi_setup_mtd(struct h2fmi *fmi, int idx)
 {
 	struct mtd_info *mtd = &fmi->mtd[idx];
 	struct h2fmi_die *die = &fmi->die[idx];
+	const struct h2fmi_geometry *g = &fmi->bus[0].geometry;
 
 	die->fmi = fmi;
-	die->bus = idx / H2FMI_CAUS;
-	die->cau = idx % H2FMI_CAUS;
+	die->bus = idx / g->caus;
+	die->cau = idx % g->caus;
 
 	mtd->priv = die;
 	mtd->dev.parent = fmi->dev;
@@ -544,14 +552,10 @@ static int h2fmi_setup_mtd(struct h2fmi *fmi, int idx)
 		return -ENOMEM;
 
 	mtd->type = MTD_NANDFLASH;
-	/* No MTD_WRITEABLE on purpose: this driver cannot write, and the NAND
-	 * it is pointed at holds somebody's iOS.  MTD_NO_ERASE goes with it --
-	 * add_mtd_device() rejects an erasesize with no ->_erase behind it
-	 * unless the device says erasing is not a thing it does.  Both come off
-	 * when the write path lands. */
+	/* PPN page reads expose the package metadata through MTD OOB. */
 	mtd->flags = MTD_NO_ERASE;
-	mtd->size = (u64)H2FMI_BLOCKS * H2FMI_ERASESIZE;
-	mtd->erasesize = H2FMI_ERASESIZE;
+	mtd->erasesize = g->pages * H2FMI_PAGE_DATA;
+	mtd->size = (u64)g->blocks * mtd->erasesize;
 	mtd->writesize = H2FMI_PAGE_DATA;
 	mtd->writebufsize = H2FMI_PAGE_DATA;
 	mtd->oobsize = H2FMI_PAGE_OOB;
@@ -578,7 +582,6 @@ static int h2fmi_probe(struct platform_device *pdev)
 	int i, ret;
 
 	BUILD_BUG_ON(H2FMI_PAGE_DATA != (1 << H2FMI_PAGE_SHIFT));
-	BUILD_BUG_ON(H2FMI_PAGES != (1 << H2FMI_PAGES_SHIFT));
 	BUILD_BUG_ON(H2FMI_PAGE_RAW != 16448);
 
 	fmi = devm_kzalloc(&pdev->dev, sizeof(*fmi), GFP_KERNEL);
@@ -612,7 +615,24 @@ static int h2fmi_probe(struct platform_device *pdev)
 			 i, readl(b->fmc + FMC_ON), readl(b->fmc + FMC_IF_CTRL));
 	}
 
-	for (i = 0; i < H2FMI_DIES; i++) {
+	/* Query both packages before publishing any part of the inventory. */
+	for (i = 0; i < H2FMI_BUSES; i++) {
+		ret = h2fmi_read_geometry(fmi, &fmi->bus[i]);
+		if (ret)
+			return dev_err_probe(&pdev->dev, ret,
+					     "bus %d: PPN discovery failed\n", i);
+		if (i && memcmp(&fmi->bus[0].geometry, &fmi->bus[i].geometry,
+				sizeof(fmi->bus[0].geometry)))
+			return dev_err_probe(&pdev->dev, -EINVAL,
+					     "PPN package geometries disagree\n");
+	}
+	fmi->ndies = H2FMI_BUSES * fmi->bus[0].geometry.caus;
+	fmi->mtd = devm_kcalloc(&pdev->dev, fmi->ndies, sizeof(*fmi->mtd), GFP_KERNEL);
+	fmi->die = devm_kcalloc(&pdev->dev, fmi->ndies, sizeof(*fmi->die), GFP_KERNEL);
+	if (!fmi->mtd || !fmi->die)
+		return -ENOMEM;
+
+	for (i = 0; i < fmi->ndies; i++) {
 		ret = h2fmi_setup_mtd(fmi, i);
 		if (ret) {
 			while (--i >= 0)
@@ -622,8 +642,9 @@ static int h2fmi_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, fmi);
-	dev_info(&pdev->dev, "%d dies, %u blocks of %u KiB each, read-only\n",
-		 H2FMI_DIES, H2FMI_BLOCKS, H2FMI_ERASESIZE / 1024);
+	dev_info(&pdev->dev, "%u CAUs, %u blocks of %u KiB each\n",
+		 fmi->ndies, fmi->bus[0].geometry.blocks,
+		 fmi->mtd[0].erasesize / 1024);
 	return 0;
 }
 
@@ -632,7 +653,7 @@ static void h2fmi_remove(struct platform_device *pdev)
 	struct h2fmi *fmi = platform_get_drvdata(pdev);
 	int i;
 
-	for (i = 0; i < H2FMI_DIES; i++)
+	for (i = 0; i < fmi->ndies; i++)
 		mtd_device_unregister(&fmi->mtd[i]);
 }
 
@@ -652,5 +673,5 @@ static struct platform_driver h2fmi_driver = {
 };
 module_platform_driver(h2fmi_driver);
 
-MODULE_DESCRIPTION("Apple S5L H2FMI / Hynix PPN NAND, read-only");
+MODULE_DESCRIPTION("Apple S5L H2FMI / Hynix PPN NAND");
 MODULE_LICENSE("GPL");
