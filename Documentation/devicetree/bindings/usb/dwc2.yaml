@@ -13,9 +13,32 @@ allOf:
   - $ref: usb-drd.yaml#
   - $ref: usb-hcd.yaml#
 
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,s5l8940x-dwc2
+              - apple,s5l8942x-dwc2
+    then:
+      required:
+        - phys
+        - phy-names
+    else:
+      required:
+        - clocks
+        - clock-names
+
 properties:
   compatible:
     oneOf:
+      - items:
+          - const: apple,s5l8942x-dwc2
+          - const: apple,s5l8940x-dwc2
+          - const: snps,dwc2
+      - items:
+          - const: apple,s5l8940x-dwc2
+          - const: snps,dwc2
       - const: brcm,bcm2835-usb
       - const: hisilicon,hi6220-usb
       - const: ingenic,jz4775-otg
@@ -185,8 +208,6 @@ required:
   - compatible
   - reg
   - interrupts
-  - clocks
-  - clock-names
 
 unevaluatedProperties: false
 
