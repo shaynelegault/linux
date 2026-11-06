@@ -207,7 +207,7 @@ config MTD_ST_SPI_FSM
 	  for a subset of connected Serial Flash devices.
 
 config MTD_APPLE_H2FMI
-	tristate "Apple S5L H2FMI / PPN NAND (read-only)"
+	tristate "Apple S5L H2FMI / PPN NAND"
 	depends on ARCH_APPLE_S5L || COMPILE_TEST
 	help
 	  Apple's flash controller as it appears on the A5 (S5L8940X/8942X),
@@ -215,14 +215,24 @@ config MTD_APPLE_H2FMI
 	  package does its own ECC, so this is a plain MTD and not a raw-NAND
 	  driver.  One MTD per CAU; geometry is read from each package.
 
-	  READ ONLY.  The driver's opcode allowlist contains no program and no
-	  erase, so it cannot damage whatever the NAND already holds -- which
-	  on an un-restored device is somebody's iOS install.
+	  The default interface is read-only. Optional verified full-page
+	  programming requires MTD_APPLE_H2FMI_WRITE. An Apple-compatible FTL
+	  must own allocation and recovery before modifying shared NAND.
 
 	  Say Y to read the NAND from Linux, for instance to check a dump or
 	  to mount iOS's own partitions.
 
 	  If unsure, say N.
+
+config MTD_APPLE_H2FMI_WRITE
+	bool "Apple H2FMI PPN page programming (EXPERIMENTAL)"
+	depends on MTD_APPLE_H2FMI
+	default n
+	help
+	  Build synchronous full-page programming with data and metadata
+	  readback. A destination must be erased; erase operations are not
+	  implemented. Allocation and recovery belong to an Apple-compatible
+	  FTL that owns the shared NAND. Enable this only with such a caller.
 
 config MTD_APPLE_H2FMI_KUNIT_TEST
 	tristate "KUnit tests for Apple H2FMI PPN geometry" if !KUNIT_ALL_TESTS

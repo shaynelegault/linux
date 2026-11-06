@@ -23,6 +23,8 @@
  *
  * This interface exposes reads through MTD. Logical-address translation and
  * allocation belong to the shared FTL above the physical page provider.
+ * Optional programming accepts an erased full page and verifies its raw
+ * data and metadata synchronously before reporting completion.
  */
 
 #include <linux/delay.h>
@@ -360,6 +362,237 @@ static void h2fmi_split_page(const u8 *raw, u8 *data, u8 *oob)
 	}
 }
 
+static int h2fmi_write_cmd(struct h2fmi *fmi, struct h2fmi_bus *b,
+			   u8 op, u8 op2)
+{
+	if (!IS_ENABLED(CONFIG_MTD_APPLE_H2FMI_WRITE))
+		return -EROFS;
+	if (!((op == 0x8a || op == 0x17 || op == 0x79) && !op2))
+		return -EPERM;
+	writel(op | op2 << 8, b->fmc + FMC_CMD);
+	return 0;
+}
+
+static int h2fmi_write_cmd1(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op)
+{
+	int ret = h2fmi_write_cmd(fmi, b, op, 0);
+
+	if (ret)
+		return ret;
+	writel(1, b->fmc + FMC_RW_CTRL);
+	return h2fmi_wait(fmi, b->fmc, FMC_STATUS, 1, 1);
+}
+
+/* Four row-address cycles follow the PPN program command. */
+static int h2fmi_write_address(struct h2fmi *fmi, struct h2fmi_bus *b,
+			       u32 row)
+{
+	int ret = h2fmi_write_cmd(fmi, b, 0x8a, 0);
+
+	if (ret)
+		return ret;
+	writel(row, b->fmc + FMC_ADDR0);
+	writel(3, b->fmc + FMC_ADDRNUM);
+	writel(9, b->fmc + FMC_RW_CTRL);
+	return h2fmi_wait(fmi, b->fmc, FMC_STATUS, 9, 9);
+}
+
+/* Same PIO FIFO used by iBEC's feature writer, with CONTROL=5 for data in.
+ * Every chunk must finish before the next one or the program confirm.
+ */
+static int h2fmi_data_in(struct h2fmi *fmi, struct h2fmi_bus *b,
+			 const u8 *buffer, u32 length)
+{
+	u32 offset, index, value;
+	int ret;
+
+	if (!length || length & 3)
+		return -EINVAL;
+	for (offset = 0; offset < length; ) {
+		u32 bytes = min_t(u32, length - offset, 0x400);
+
+		writel(5, b->fmi + FMI_CONFIG);
+		writel((bytes << 8 & 0x7fc00) | 1,
+		       b->fmi + FMI_PIO_CONFIG);
+		writel(5, b->fmi + FMI_CONTROL);
+		ret = readl_poll_timeout(b->fmi + FMI_DMA_STATUS, value,
+					 value & 0x18, 0, 100000);
+		if (ret)
+			return ret;
+		for (index = 0; index < bytes; index += 4)
+			writel(get_unaligned_le32(buffer + offset + index),
+			       b->fmi + FMI_DATA);
+		ret = h2fmi_wait(fmi, b->fmi, FMI_STATUS, 2, 2);
+		if (ret)
+			return ret;
+		offset += bytes;
+	}
+	return 0;
+}
+
+/* Program status uses 79, as in iBEC's write_bootpage path. */
+static int h2fmi_write_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *status)
+{
+	u32 value;
+	int ret = h2fmi_write_cmd1(fmi, b, 0x79);
+
+	if (ret)
+		return ret;
+	h2fmi_clear_irqs(b);
+	writel(0x100, b->fmi + FMI_INTEN);
+	writel(readl(b->fmc + FMC_IF_CTRL) & ~0x100000u,
+	       b->fmc + FMC_IF_CTRL);
+	writel(0x4040, b->fmc + FMC_STATUS_MASK);
+	writel(0, b->fmc + FMC_DATANUM);
+	writel(0x20, b->fmc + FMC_INTMASK);
+	writel(0x50, b->fmc + FMC_RW_CTRL);
+	ret = readl_poll_timeout(b->fmc + FMC_STATUS, value,
+				 value & 0x20, 0, 2000000);
+	if (!ret)
+		*status = readl(b->fmc + FMC_NAND_STATUS);
+	writel(0, b->fmc + FMC_RW_CTRL);
+	h2fmi_clear_irqs(b);
+	return ret;
+}
+
+/* Caller holds the bus lock. A failed mutation permanently stops this bus. */
+static int h2fmi_program_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
+				     u32 row, const u8 *raw)
+{
+	u32 on, if_ctrl;
+	u8 status = 0;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_MTD_APPLE_H2FMI_WRITE))
+		return -EROFS;
+	if (b->failed)
+		return -EIO;
+	on = readl(b->fmc + FMC_ON);
+	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
+	if (on != 5)
+		return -EIO;
+	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+	h2fmi_clear_irqs(b);
+	ret = h2fmi_write_address(fmi, b, row);
+	if (!ret)
+		ret = h2fmi_data_in(fmi, b, raw, H2FMI_PAGE_RAW);
+	if (!ret)
+		ret = h2fmi_write_cmd1(fmi, b, 0x17);
+	if (!ret)
+		ret = h2fmi_write_status(fmi, b, &status);
+	/* CMD 79 returns NAND write status, not the managed read result.
+	 * iBEC 12H321 tests failure bits 0 and 4 after ready bit 6.
+	 */
+	if (!ret)
+		ret = h2fmi_program_status(status);
+	writel(0, b->fmc + FMC_CE_CTRL);
+	h2fmi_device_reset(b, on, if_ctrl);
+	if (ret) {
+		b->failed = true;
+		dev_err(fmi->dev, "PPN program row %08x: status %02x, error %d\n",
+			row, status, ret);
+	}
+	return ret;
+}
+
+static void h2fmi_join_page(u8 *raw, const u8 *data, const u8 *oob)
+{
+	unsigned int chunk;
+
+	for (chunk = 0; chunk < H2FMI_CHUNKS; chunk++) {
+		u8 *dst = raw + chunk * H2FMI_CHUNK_RAW;
+		const u8 *src = data + chunk * 4096;
+
+		memcpy(dst, src, H2FMI_CHUNK_LO);
+		memcpy(dst + H2FMI_CHUNK_LO, oob + chunk * H2FMI_CHUNK_META,
+		       H2FMI_CHUNK_META);
+		memcpy(dst + H2FMI_CHUNK_LO + H2FMI_CHUNK_META,
+		       src + H2FMI_CHUNK_LO, H2FMI_CHUNK_HI);
+	}
+}
+
+/* Canonical data and metadata form one complete PPN program unit. */
+static int h2fmi_program_page(struct h2fmi *fmi, struct h2fmi_bus *b,
+			      unsigned int cau, unsigned int block,
+			      unsigned int page, const u8 *data, const u8 *oob)
+{
+	u32 row;
+	u8 status, *expected;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_MTD_APPLE_H2FMI_WRITE))
+		return -EROFS;
+	if (!data || !oob)
+		return -EINVAL;
+	ret = h2fmi_page_row(&b->geometry, cau, block, page, &row);
+	if (ret)
+		return ret;
+	/* Preserve the boot block and both package-reserved tail blocks. */
+	if (!block || block >= b->geometry.blocks - 2)
+		return -EPERM;
+	expected = kmalloc(H2FMI_PAGE_RAW, GFP_KERNEL);
+	if (!expected)
+		return -ENOMEM;
+	h2fmi_join_page(expected, data, oob);
+	mutex_lock(&b->lock);
+	ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row, 4,
+				     b->page, H2FMI_PAGE_RAW, &status);
+	if (ret)
+		goto out;
+	if (status != PPN_ST_ERASED ||
+	    memchr_inv(b->page, 0xff, H2FMI_PAGE_RAW)) {
+		ret = -EEXIST;
+		goto out;
+	}
+	ret = h2fmi_program_transaction(fmi, b, row, expected);
+	if (ret)
+		goto out;
+	ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row, 4,
+				     b->page, H2FMI_PAGE_RAW, &status);
+	if (ret || status != PPN_ST_GOOD ||
+	    memcmp(b->page, expected, H2FMI_PAGE_RAW)) {
+		b->failed = true;
+		ret = ret ? ret : -EIO;
+		dev_err(fmi->dev, "PPN readback row %08x: status %02x, error %d\n",
+			row, status, ret);
+		goto out;
+	}
+out:
+	mutex_unlock(&b->lock);
+	kfree(expected);
+	return ret;
+}
+
+/* Publish MTD progress after the whole data/OOB unit passes readback. */
+static int h2fmi_mtd_write_oob(struct mtd_info *mtd, loff_t to,
+			       struct mtd_oob_ops *ops)
+{
+	struct h2fmi_die *die = mtd->priv;
+	struct h2fmi *fmi = die->fmi;
+	struct h2fmi_bus *b = &fmi->bus[die->bus];
+	u64 page = (u64)to >> H2FMI_PAGE_SHIFT;
+	u32 block = page >> b->geometry.page_bits;
+	u32 pg = page & (b->geometry.pages - 1);
+	int ret;
+
+	ops->retlen = 0;
+	ops->oobretlen = 0;
+	if (!IS_ENABLED(CONFIG_MTD_APPLE_H2FMI_WRITE))
+		return -EROFS;
+	if (to < 0 || to >= mtd->size || to & H2FMI_PAGE_MASK ||
+	    ops->mode != MTD_OPS_PLACE_OOB || ops->len != H2FMI_PAGE_DATA ||
+	    ops->ooblen != H2FMI_PAGE_OOB || ops->ooboffs ||
+	    !ops->datbuf || !ops->oobbuf)
+		return -EINVAL;
+	ret = h2fmi_program_page(fmi, b, die->cau, block, pg,
+				 ops->datbuf, ops->oobbuf);
+	if (!ret) {
+		ops->retlen = H2FMI_PAGE_DATA;
+		ops->oobretlen = H2FMI_PAGE_OOB;
+	}
+	return ret;
+}
+
 static int h2fmi_read_page_at(struct mtd_info *mtd, loff_t from,
 			      u8 *data, u8 *oob, u8 *stp)
 {
@@ -554,6 +787,10 @@ static int h2fmi_setup_mtd(struct h2fmi *fmi, int idx)
 	mtd->type = MTD_NANDFLASH;
 	/* PPN page reads expose the package metadata through MTD OOB. */
 	mtd->flags = MTD_NO_ERASE;
+	if (IS_ENABLED(CONFIG_MTD_APPLE_H2FMI_WRITE)) {
+		mtd->flags |= MTD_WRITEABLE;
+		mtd->_write_oob = h2fmi_mtd_write_oob;
+	}
 	mtd->erasesize = g->pages * H2FMI_PAGE_DATA;
 	mtd->size = (u64)g->blocks * mtd->erasesize;
 	mtd->writesize = H2FMI_PAGE_DATA;
