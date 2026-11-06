@@ -1,37 +1,40 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple S5L USB PHY driver (otgphyctrl,s5l8940x)
- * Register values taken from a live iBoot/DFU PHY dump on real hardware
- * (see docs/PHY-DUMP.md): OPHYPWR=0x6 OPHYCLK=0x1 UNK1_1C=0x6 UNK2_44=0xF8
- * UNK4_60=0x200 ORSTCON=0x0 -- these are the exact bits iBoot leaves set
- * while its own USB (DFU) is actively enumerated, i.e. known-working state.
+ * Apple S5L USB PHY driver (otgphyctrl,s5l8940x).
+ * Firmware can hand over after powering the PHY down. Initialize the common
+ * clocks and PHY before either the gadget or the HSIC host uses the block.
  */
 
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/regulator/consumer.h>
 
 #define OPHYPWR		0x00
 #define OPHYCLK		0x04
 #define ORSTCON	0x08
 #define OPHYUNK1	0x1C
-#define OPHYUNK2	0x44
 #define OPHYUNK4	0x60
 
-#define OPHYPWR_PLLPOWERDOWN		BIT(1)
-#define OPHYPWR_XOPOWERDOWN		BIT(2)
+#define OPHYPWR_ACTIVE			0x6
 #define OPHYCLK_CLKSEL_MASK		0x3
-#define OPHYCLK_CLKSEL_24MHZ		0x1
 #define ORSTCON_PHYSWRESET		BIT(0)
 
-/* Values as observed live from iBoot's working PHY state */
+/* S5L8942X values from the native PHY power-on sequence. */
 #define OPHYUNK4_START			0x200
-#define OPHYUNK1_START			0x6
-#define OPHYUNK2_START			0xF8
+#define OPHYUNK1_START			0x4
+#define OPHYUNK1_OTG_ENABLE		BIT(1)
+#define OPHY_UOTGTUNE1			0x40
+#define OPHY_UOTGTUNE2			0x44
+#define OPHY_UOTGTUNE1_DEVICE		0x549
+#define OPHY_UOTGTUNE2_DEVICE		0x2ff3
 
 #define PMGR_BASE		0x3F100000
 #define PMGR_GATE_ON		0xF
@@ -66,19 +69,15 @@
  * is not a device-clocks entry at all.  Writing a gate value at `base + 5 * 4`
  * and `base + 292 * 4`, as this driver did, hit PERFCNT's gate and an empty
  * address respectively.  Neither has anything to do with USB. */
+/* Native firmware enables UPERF, OTG and USBREG in this order. The ADT
+ * confirms UPERF (id 40, index 0x20) and USBREG (id 42, index 0x26) as
+ * USB's parents. USB-PHY's zero register index does not remove its parents.
+ */
+#define PMGR_UPERF		0x1080
 #define PMGR_USB_OTG		0x1084
+#define PMGR_USBREG		0x1098
 #define PMGR_USB_EHCI		0x1088
 #define PMGR_USB_OHCI0		0x1090
-#define PMGR_USB_OHCI1		0x1094
-
-/* Tuning constants from ADT otgphyctrl node (device-mode values):
- *   uotgtune1-device = 0x549, uotgtune2-device = 0x2ff3
- *   ref-clock-sel    = 3
- *   usbhostset-en-incrx = 0xE0
- * Register offsets are guesses matching Samsung Exynos S5L OTG PHY layout
- * (which the Apple block is derived from). To be verified by XNU-hook dump. */
-#define OPHY_UOTGTUNE1		0x30
-#define OPHY_UOTGTUNE2		0x34
 
 /* The host side: EHCI and its HSIC port, where the Wi-Fi chip is.
  *
@@ -108,6 +107,14 @@
  * console, the network -- must not wait for it. */
 #define USBCPLX_HSIC_EN		BIT(2)
 
+struct s5l_usbphy_soc_data {
+	bool cold_init;
+};
+
+static const struct s5l_usbphy_soc_data s5l8942x_usbphy_data = {
+	.cold_init = true,
+};
+
 struct s5l_usbphy {
 	void __iomem *base;
 	void __iomem *pmgr;
@@ -117,6 +124,10 @@ struct s5l_usbphy {
 	struct regulator *lpo_supply;	/* the chip's 32 kHz sleep clock */
 	bool lpo_supply_on;
 	struct device *dev;
+	struct clk *refclk;
+	const struct s5l_usbphy_soc_data *data;
+	struct mutex lock;
+	unsigned int init_users;
 	struct phy *phys[2];		/* [0] OTG, [1] host/HSIC */
 };
 
@@ -130,7 +141,7 @@ static int s5l_pmgr_on(struct s5l_usbphy *p, u32 off)
 	writel((v & ~0x10f) | PMGR_GATE_ON, p->pmgr + off);
 	for (n = 0; n < 1000; n++) {
 		v = readl(p->pmgr + off);
-		if (!((v ^ (v >> 4)) & 0xf))
+		if ((v & 0xff) == 0xff)
 			return 0;
 		udelay(1);
 	}
@@ -138,105 +149,194 @@ static int s5l_pmgr_on(struct s5l_usbphy *p, u32 off)
 	return -ETIMEDOUT;
 }
 
-static void phy_dump_regs(struct s5l_usbphy *p, const char *tag)
+static int s5l_usbphy_clk_sel(unsigned long rate)
 {
-	/* Layout learned empirically from the pre-init snapshot:
-	 *   0x00 OPHYPWR    (was 0x6 from iBoot)
-	 *   0x04 OPHYCLK    (was 0x1 = 24MHz)
-	 *   0x08 ORSTCON    (was 0x0)
-	 *   0x1C OPHYUNK1   (was 0x6)   -- probably uotgtune1
-	 *   0x40 ???        (probe, might also be tuning)
-	 *   0x44 OPHYUNK2   (was 0x2ff3 == ADT uotgtune2-device)
-	 *   0x60 OPHYUNK4   (was 0x200)
-	 * We keep 0x30 and 0x34 in the dump only to confirm they are unused
-	 * (their pre-init values were 0). */
-	pr_err("PHY dump %s: PWR=0x%08x CLK=0x%08x RST=0x%08x U1C=0x%08x R30=0x%08x R34=0x%08x R40=0x%08x U44=0x%08x U60=0x%08x\n",
-	       tag,
-	       readl(p->base + OPHYPWR),
-	       readl(p->base + OPHYCLK),
-	       readl(p->base + ORSTCON),
-	       readl(p->base + OPHYUNK1),
-	       readl(p->base + 0x30),
-	       readl(p->base + 0x34),
-	       readl(p->base + 0x40),
-	       readl(p->base + OPHYUNK2),
-	       readl(p->base + OPHYUNK4));
+	switch (rate) {
+	case 12000000:
+		return 0;
+	case 24000000:
+		return 1;
+	case 48000000:
+		return 2;
+	default:
+		return -EINVAL;
+	}
+}
+
+static bool s5l_usbphy_is_ready(struct s5l_usbphy *p)
+{
+	int clksel = s5l_usbphy_clk_sel(clk_get_rate(p->refclk));
+
+	return clksel >= 0 &&
+	       (readl(p->base + OPHYCLK) & OPHYCLK_CLKSEL_MASK) == clksel &&
+	       readl(p->base + OPHYPWR) == OPHYPWR_ACTIVE &&
+	       !(readl(p->base + ORSTCON) & ORSTCON_PHYSWRESET) &&
+	       readl(p->base + OPHY_UOTGTUNE1) == OPHY_UOTGTUNE1_DEVICE &&
+	       readl(p->base + OPHY_UOTGTUNE2) == OPHY_UOTGTUNE2_DEVICE &&
+	       readl(p->base + OPHYUNK4) == OPHYUNK4_START;
+}
+
+static int s5l_usbphy_cold_init(struct s5l_usbphy *p)
+{
+	unsigned long rate = clk_get_rate(p->refclk);
+	int clksel = s5l_usbphy_clk_sel(rate);
+	u32 v;
+
+	if (clksel < 0) {
+		dev_err(p->dev, "unsupported PHY reference clock: %lu Hz\n", rate);
+		return clksel;
+	}
+
+	writel(OPHYUNK4_START, p->base + OPHYUNK4);
+	writel(OPHYPWR_ACTIVE, p->base + OPHYPWR);
+	writel(OPHYUNK1_START, p->base + OPHYUNK1);
+	writel(OPHY_UOTGTUNE1_DEVICE, p->base + OPHY_UOTGTUNE1);
+	writel(OPHY_UOTGTUNE2_DEVICE, p->base + OPHY_UOTGTUNE2);
+	udelay(10);
+
+	v = readl(p->base + OPHYCLK);
+	writel((v & ~OPHYCLK_CLKSEL_MASK) | clksel, p->base + OPHYCLK);
+	if ((readl(p->base + OPHYCLK) & OPHYCLK_CLKSEL_MASK) != clksel) {
+		dev_err(p->dev, "PHY reference clock selection did not latch\n");
+		return -EIO;
+	}
+
+	return 0;
 }
 
 static int s5l_usbphy_init(struct phy *phy)
 {
 	struct s5l_usbphy *p = phy_get_drvdata(phy);
+	u32 v;
+	int ret = 0;
 
-	dev_info(p->dev, "PHY init start\n");
+	mutex_lock(&p->lock);
+	if (p->init_users) {
+		p->init_users++;
+		goto out;
+	}
 
-	/* -- pre-touch snapshot: what did iBoot leave us? -- */
-	phy_dump_regs(p, "pre");
+	if (p->data && p->data->cold_init) {
+		ret = clk_prepare_enable(p->refclk);
+		if (ret)
+			goto out;
 
-	/* The gadget's own gate.  iBoot leaves USB-OTG on -- its DFU runs on it,
-	 * which is how this port ever enumerated with every gate write landing
-	 * in a hole -- so this is normally a no-op that confirms the state
-	 * rather than changes it.  The host-side gates belong to the host PHY
-	 * and are switched in s5l_hostphy_power_on(); OHCI1 nothing here uses.
-	 *
-	 * Logged by name and by register, because the old messages named ids
-	 * that were not the ids being written. */
-	dev_info(p->dev, "usb-complex pre: OTG(88)=0x%08x EHCI(89)=0x%08x OHCI0(90)=0x%08x OHCI1(91)=0x%08x\n",
-		 readl(p->pmgr + PMGR_USB_OTG), readl(p->pmgr + PMGR_USB_EHCI),
-		 readl(p->pmgr + PMGR_USB_OHCI0), readl(p->pmgr + PMGR_USB_OHCI1));
+		/* Native firmware enables these parents in this order. */
+		if ((readl(p->pmgr + PMGR_UPERF) & 0xff) != 0xff ||
+		    (readl(p->pmgr + PMGR_USB_OTG) & 0xff) != 0xff ||
+		    (readl(p->pmgr + PMGR_USBREG) & 0xff) != 0xff)
+			usleep_range(10000, 11000);
 
-	s5l_pmgr_on(p, PMGR_USB_OTG);
+		ret = s5l_pmgr_on(p, PMGR_UPERF);
+		if (ret)
+			goto disable_clock;
+	}
 
-	dev_info(p->dev, "usb-complex OTG(88) now 0x%08x\n",
-		 readl(p->pmgr + PMGR_USB_OTG));
-
+	ret = s5l_pmgr_on(p, PMGR_USB_OTG);
+	if (ret)
+		goto disable_clock;
+	if (p->data && p->data->cold_init) {
+		ret = s5l_pmgr_on(p, PMGR_USBREG);
+		if (ret)
+			goto disable_clock;
+	}
 	udelay(100);
 
-	/* -- post-gate snapshot: are the regs alive now? -- */
-	phy_dump_regs(p, "post-gates");
-
-	/* DECISION: DO NOT overwrite iBoot-programmed PHY registers.
-	 *
-	 * Empirical dump on live hardware (2026-09-13):
-	 *   U1C=0x06 (matches previous "OPHYUNK1_START"),
-	 *   U44=0x2ff3 (== ADT uotgtune2-device — NOT 0xF8 as previous
-	 *               driver comment claimed. Overwriting to 0xF8 breaks
-	 *               PHY and panics the kernel),
-	 *   U60=0x200 (matches previous "OPHYUNK4_START"),
-	 *   PWR=0x06, CLK=0x01 (24MHz clksel already selected).
-	 *
-	 * So iBoot already leaves the PHY in the correct static state.
-	 * Only thing this driver needs to do is: (a) make sure clock gates
-	 * are ON (they weren't in the dump, but PHY regs were still alive),
-	 * (b) release the soft reset, and (c) log what we saw so any residual
-	 * problem is easy to spot in the UART log.
-	 *
-	 * Old comment claimed "OPHYUNK2=0xF8 is what iBoot's DFU state
-	 * leaves set". That was wrong; the correct DFU state is 0x2ff3. */
-
+	/* Legacy compatibles retain the tuning established by firmware. */
+	if (p->data && p->data->cold_init && !s5l_usbphy_is_ready(p)) {
+		ret = s5l_usbphy_cold_init(p);
+		if (ret)
+			goto disable_clock;
+	}
 	udelay(10);
 
-	/* Toggle PHY soft reset — clears any pending state without touching
-	 * the tuning constants. */
-	writel(readl(p->base + ORSTCON) | ORSTCON_PHYSWRESET, p->base + ORSTCON);
+	writel(readl(p->base + ORSTCON) | ORSTCON_PHYSWRESET,
+	       p->base + ORSTCON);
 	udelay(20);
-	writel(readl(p->base + ORSTCON) & ~ORSTCON_PHYSWRESET, p->base + ORSTCON);
+	writel(readl(p->base + ORSTCON) & ~ORSTCON_PHYSWRESET,
+	       p->base + ORSTCON);
 	udelay(1000);
+	ret = readl_poll_timeout(p->base + ORSTCON, v,
+				 !(v & ORSTCON_PHYSWRESET), 1, 1000);
+	if (ret) {
+		dev_err(p->dev, "PHY reset did not clear: 0x%08x\n", v);
+		goto disable_clock;
+	}
+	if (p->data && p->data->cold_init && !s5l_usbphy_is_ready(p)) {
+		dev_err(p->dev, "PHY power or tuning did not latch\n");
+		ret = -EIO;
+		goto disable_clock;
+	}
+	p->init_users = 1;
+	goto out;
 
-	phy_dump_regs(p, "post-init");
-
-	dev_info(p->dev, "PHY init done\n");
-	return 0;
+disable_clock:
+	if (p->data && p->data->cold_init)
+		clk_disable_unprepare(p->refclk);
+out:
+	mutex_unlock(&p->lock);
+	return ret;
 }
 
 static int s5l_usbphy_exit(struct phy *phy)
 {
+	struct s5l_usbphy *p = phy_get_drvdata(phy);
+
+	mutex_lock(&p->lock);
+	if (p->init_users && !--p->init_users &&
+	    p->data && p->data->cold_init)
+		clk_disable_unprepare(p->refclk);
+	mutex_unlock(&p->lock);
 	return 0;
 }
 
+/* Native USB connect enables the OTG PHY before clearing DCTL's soft
+ * disconnect. Initializing the shared PHY alone leaves this bit clear.
+ * Keep it in the OTG output's power callbacks so HSIC remains independent.
+ */
+static int s5l_usbphy_set_otg(struct phy *phy, bool enable)
+{
+	struct s5l_usbphy *p = phy_get_drvdata(phy);
+	u32 value, expected;
+	int ret = 0;
+
+	if (!p->data || !p->data->cold_init)
+		return 0;
+
+	mutex_lock(&p->lock);
+	if (!p->init_users) {
+		ret = -EIO;
+		goto out;
+	}
+	value = readl(p->base + OPHYUNK1);
+	expected = enable ? OPHYUNK1_OTG_ENABLE : 0;
+	writel((value & ~OPHYUNK1_OTG_ENABLE) | expected,
+	       p->base + OPHYUNK1);
+	if ((readl(p->base + OPHYUNK1) & OPHYUNK1_OTG_ENABLE) != expected) {
+		dev_err(p->dev, "OTG PHY power state did not latch\n");
+		ret = -EIO;
+	}
+out:
+	mutex_unlock(&p->lock);
+	return ret;
+}
+
+static int s5l_usbphy_power_on(struct phy *phy)
+{
+	return s5l_usbphy_set_otg(phy, true);
+}
+
+static int s5l_usbphy_power_off(struct phy *phy)
+{
+	return s5l_usbphy_set_otg(phy, false);
+}
+
 static const struct phy_ops s5l_usbphy_ops = {
-	.init  = s5l_usbphy_init,
-	.exit  = s5l_usbphy_exit,
-	.owner = THIS_MODULE,
+	.init      = s5l_usbphy_init,
+	.exit      = s5l_usbphy_exit,
+	.power_on  = s5l_usbphy_power_on,
+	.power_off = s5l_usbphy_power_off,
+	.owner     = THIS_MODULE,
 };
 
 static int s5l_hostphy_power_on(struct phy *phy)
@@ -287,11 +387,13 @@ static int s5l_hostphy_power_on(struct phy *phy)
 	ret = s5l_pmgr_on(p, PMGR_USB_EHCI);
 	if (ret)
 		return ret;
-	s5l_pmgr_on(p, PMGR_USB_OHCI0);
+	ret = s5l_pmgr_on(p, PMGR_USB_OHCI0);
+	if (ret)
+		return ret;
 	if (p->usbcplx)
 		writel(readl(p->usbcplx) | USBCPLX_HSIC_EN, p->usbcplx);
 
-	dev_info(p->dev, "host PHY on: EHCI(89)=0x%08x OHCI0(90)=0x%08x usb-complex=0x%08x\n",
+	dev_dbg(p->dev, "host PHY on: EHCI(89)=0x%08x OHCI0(90)=0x%08x usb-complex=0x%08x\n",
 		 readl(p->pmgr + PMGR_USB_EHCI), readl(p->pmgr + PMGR_USB_OHCI0),
 		 p->usbcplx ? readl(p->usbcplx) : 0);
 	return 0;
@@ -312,7 +414,24 @@ static int s5l_hostphy_power_off(struct phy *phy)
 	return 0;
 }
 
+
+static int s5l_hostphy_init(struct phy *phy)
+{
+	struct s5l_usbphy *p = phy_get_drvdata(phy);
+
+	return p->data && p->data->cold_init ? s5l_usbphy_init(phy) : 0;
+}
+
+static int s5l_hostphy_exit(struct phy *phy)
+{
+	struct s5l_usbphy *p = phy_get_drvdata(phy);
+
+	return p->data && p->data->cold_init ? s5l_usbphy_exit(phy) : 0;
+}
+
 static const struct phy_ops s5l_hostphy_ops = {
+	.init      = s5l_hostphy_init,
+	.exit      = s5l_hostphy_exit,
 	.power_on  = s5l_hostphy_power_on,
 	.power_off = s5l_hostphy_power_off,
 	.owner     = THIS_MODULE,
@@ -337,13 +456,19 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 	struct phy *phy;
 	struct phy_provider *provider;
 
-	dev_info(&pdev->dev, "Apple S5L USB PHY probe\n");
-
 	p = devm_kzalloc(&pdev->dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
 
 	p->dev = &pdev->dev;
+	p->data = device_get_match_data(&pdev->dev);
+	mutex_init(&p->lock);
+	if (p->data && p->data->cold_init) {
+		p->refclk = devm_clk_get(&pdev->dev, "ref");
+		if (IS_ERR(p->refclk))
+			return dev_err_probe(&pdev->dev, PTR_ERR(p->refclk),
+					     "failed to get PHY reference clock\n");
+	}
 
 	p->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(p->base)) {
@@ -385,11 +510,11 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 	if (IS_ERR(provider))
 		return PTR_ERR(provider);
 
-	dev_info(&pdev->dev, "Apple S5L USB PHY registered\n");
 	return 0;
 }
 
 static const struct of_device_id s5l_usbphy_of_match[] = {
+	{ .compatible = "apple,s5l8942x-otgphy", .data = &s5l8942x_usbphy_data },
 	{ .compatible = "apple,s5l8940x-otgphy" },
 	{ .compatible = "apple,s5l8930x-otgphy" },
 	{ },
