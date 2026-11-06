@@ -9,4 +9,4 @@ Memory Technology Device (MTD)
 
    spi-intel
    nand_ecc
-   spi-nor
+   spi-nor   apple-sftl
