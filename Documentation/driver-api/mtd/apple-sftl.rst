@@ -43,7 +43,9 @@ an error. A failed runtime read stops subsequent I/O from this map instance.
 H2FMI unregisters the child before releasing its controller state. The block
 frontend freezes and drains requests during removal. Its request buffer is
 allocated before the disk becomes visible, while blocking requests serialize
-access to that buffer and the provider.
+access to that buffer and the provider. Request processing uses a NOIO
+allocation scope so map and provider buffers cannot trigger recursive
+writeback while the queue lock is held.
 
 The reader has finite operating limits. ``max_page_reads`` defaults to 32,768
 physical page requests and ``max_io_time_ms`` defaults to ten minutes from

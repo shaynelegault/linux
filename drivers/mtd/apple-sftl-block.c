@@ -9,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 
 #include "apple-sftl.h"
@@ -182,10 +183,13 @@ static blk_status_t sftl_queue_rq(struct blk_mq_hw_ctx *hctx,
 	struct request *request = data->rq;
 	struct sftl_disk *sftl = request->q->queuedata;
 	sector_t capacity = get_capacity(sftl->disk);
+	unsigned int noio_flags;
 	blk_status_t status;
 	int ret = 0;
 
 	mutex_lock(&sftl->io_lock);
+	/* Map and provider buffers may allocate while the root disk is busy. */
+	noio_flags = memalloc_noio_save();
 	blk_mq_start_request(request);
 	if (sftl->dead) {
 		ret = -ENODEV;
@@ -203,6 +207,7 @@ static blk_status_t sftl_queue_rq(struct blk_mq_hw_ctx *hctx,
 	} else {
 		ret = sftl_read_request(sftl, request);
 	}
+	memalloc_noio_restore(noio_flags);
 	mutex_unlock(&sftl->io_lock);
 	status = errno_to_blk_status(ret);
 	blk_mq_end_request(request, status);
