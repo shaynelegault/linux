@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,s5l8942x-usb-phy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple S5L8942X USB and HSIC PHY
+
+maintainers:
+  - Shayne Legault <8741557+shaynelegault@users.noreply.github.com>
+
+description: |
+  The OTG and HSIC PHY outputs share reference-clock selection, PHY power
+  and reset. The first PHY argument selects the output: 0 for USB OTG,
+  1 for the HSIC host. The HSIC supplies power the attached peripheral.
+
+select:
+  properties:
+    compatible:
+      contains:
+        const: apple,s5l8942x-otgphy
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - const: apple,s5l8942x-otgphy
+      - const: apple,s5l8940x-otgphy
+
+  reg:
+    items:
+      - description: PHY control registers
+      - description: USB complex control registers
+
+  clocks:
+    maxItems: 1
+    description: PHY reference clock, at 12, 24 or 48 MHz
+
+  clock-names:
+    const: ref
+
+  '#phy-cells':
+    const: 1
+
+  hsic-supply:
+    description: Supply controlling the HSIC peripheral's reset/power input
+
+  lpo-supply:
+    description: Supply controlling the HSIC peripheral's low-power clock
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - '#phy-cells'
+
+additionalProperties: false
+
+examples:
+  - |
+    phy@36000000 {
+        compatible = "apple,s5l8942x-otgphy", "apple,s5l8940x-otgphy";
+        reg = <0x36000000 0x1000>, <0x3f108000 0x1000>;
+        clocks = <&refclk24mhz>;
+        clock-names = "ref";
+        #phy-cells = <1>;
+    };
