@@ -342,6 +342,7 @@ static const struct phy_ops s5l_usbphy_ops = {
 static int s5l_hostphy_power_on(struct phy *phy)
 {
 	struct s5l_usbphy *p = phy_get_drvdata(phy);
+	bool lpo_enabled = false, hsic_enabled = false;
 	int ret;
 
 	/* The 32 kHz clock first, the way a chip expects its sleep clock
@@ -361,6 +362,7 @@ static int s5l_hostphy_power_on(struct phy *phy)
 		if (ret)
 			return ret;
 		p->lpo_supply_on = true;
+		lpo_enabled = true;
 		msleep(10);
 	}
 
@@ -368,8 +370,10 @@ static int s5l_hostphy_power_on(struct phy *phy)
 		struct regulator *r = devm_regulator_get_optional(p->dev, "hsic");
 
 		if (IS_ERR(r)) {
-			if (PTR_ERR(r) == -EPROBE_DEFER)
-				return -EPROBE_DEFER;
+			if (PTR_ERR(r) == -EPROBE_DEFER) {
+				ret = -EPROBE_DEFER;
+				goto err_disable_lpo;
+			}
 			dev_warn(p->dev, "no hsic-supply (%ld): the HSIC device stays unpowered\n",
 				 PTR_ERR(r));
 		} else {
@@ -379,17 +383,18 @@ static int s5l_hostphy_power_on(struct phy *phy)
 	if (p->hsic_supply && !p->hsic_supply_on) {
 		ret = regulator_enable(p->hsic_supply);
 		if (ret)
-			return ret;
+			goto err_disable_lpo;
 		p->hsic_supply_on = true;
+		hsic_enabled = true;
 		msleep(10);
 	}
 
 	ret = s5l_pmgr_on(p, PMGR_USB_EHCI);
 	if (ret)
-		return ret;
+		goto err_disable_hsic;
 	ret = s5l_pmgr_on(p, PMGR_USB_OHCI0);
 	if (ret)
-		return ret;
+		goto err_disable_hsic;
 	if (p->usbcplx)
 		writel(readl(p->usbcplx) | USBCPLX_HSIC_EN, p->usbcplx);
 
@@ -397,6 +402,18 @@ static int s5l_hostphy_power_on(struct phy *phy)
 		 readl(p->pmgr + PMGR_USB_EHCI), readl(p->pmgr + PMGR_USB_OHCI0),
 		 p->usbcplx ? readl(p->usbcplx) : 0);
 	return 0;
+
+err_disable_hsic:
+	if (hsic_enabled) {
+		regulator_disable(p->hsic_supply);
+		p->hsic_supply_on = false;
+	}
+err_disable_lpo:
+	if (lpo_enabled) {
+		regulator_disable(p->lpo_supply);
+		p->lpo_supply_on = false;
+	}
+	return ret;
 }
 
 static int s5l_hostphy_power_off(struct phy *phy)
