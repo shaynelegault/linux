@@ -421,6 +421,45 @@ int dwc2_check_core_version(struct dwc2_hsotg *hsotg)
 	return 0;
 }
 
+struct dwc2_platform_quirks {
+	u32 firmware_clock_gates;
+};
+
+static const struct dwc2_platform_quirks s5l8942x_quirks = {
+	.firmware_clock_gates = PCGCTL_STOPPCLK | PCGCTL_GATEHCLK,
+};
+
+static const struct of_device_id dwc2_platform_quirks_match[] = {
+	{ .compatible = "apple,s5l8942x-dwc2", .data = &s5l8942x_quirks },
+	{ }
+};
+
+static int dwc2_restore_firmware_clocks(struct dwc2_hsotg *hsotg)
+{
+	const struct dwc2_platform_quirks *quirks;
+	const struct of_device_id *match;
+	u32 value;
+
+	match = of_match_node(dwc2_platform_quirks_match, hsotg->dev->of_node);
+	if (!match)
+		return 0;
+	quirks = match->data;
+
+	/* The PHY has enabled the parent gates before this access. */
+	value = ioread32(hsotg->regs + PCGCTL);
+	if (value & quirks->firmware_clock_gates) {
+		iowrite32(value & ~quirks->firmware_clock_gates,
+			  hsotg->regs + PCGCTL);
+		udelay(100);
+		if (ioread32(hsotg->regs + PCGCTL) & quirks->firmware_clock_gates) {
+			dev_err(hsotg->dev, "controller clocks did not resume\n");
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
 /**
  * dwc2_driver_probe() - Called when the DWC_otg core is bound to the DWC_otg
  * driver
@@ -480,6 +519,10 @@ static int dwc2_driver_probe(struct platform_device *dev)
 	retval = dwc2_lowlevel_hw_enable(hsotg);
 	if (retval)
 		return retval;
+
+	retval = dwc2_restore_firmware_clocks(hsotg);
+	if (retval)
+		goto error;
 
 	hsotg->needs_byte_swap = dwc2_check_core_endianness(hsotg);
 
