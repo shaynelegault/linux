@@ -2,6 +2,7 @@
 #ifndef MTD_APPLE_H2FMI_H
 #define MTD_APPLE_H2FMI_H
 
+#include <linux/bits.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -117,6 +118,12 @@ static inline int h2fmi_page_status(u8 status)
 	default:
 		return -EBADMSG;
 	}
+}
+
+/* CMD 79 reports ready at bit 6 and program failure at bits 0 and 4. */
+static inline int h2fmi_program_status(u8 status)
+{
+	return (status & BIT(6)) && !(status & (BIT(0) | BIT(4))) ? 0 : -EIO;
 }
 
 #endif

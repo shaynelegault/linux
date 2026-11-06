@@ -153,12 +153,26 @@ static void h2fmi_status_test(struct kunit *test)
 	}
 }
 
+static void h2fmi_program_status_test(struct kunit *test)
+{
+	unsigned int status;
+
+	for (status = 0; status <= 0xff; status++) {
+		bool ready = status & 0x40;
+		bool failed = status & 0x11;
+
+		KUNIT_EXPECT_EQ(test, h2fmi_program_status(status),
+				ready && !failed ? 0 : -EIO);
+	}
+}
+
 static struct kunit_case h2fmi_test_cases[] = {
 	KUNIT_CASE(h2fmi_geometry_test),
 	KUNIT_CASE(h2fmi_invalid_geometry_test),
 	KUNIT_CASE(h2fmi_row_test),
 	KUNIT_CASE(h2fmi_status_test),
 	KUNIT_CASE(h2fmi_slc_row_test),
+	KUNIT_CASE(h2fmi_program_status_test),
 	{}
 };
 
