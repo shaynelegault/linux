@@ -615,10 +615,12 @@
 		 * 0x300000 therefore lands at 0x6400000 here, 0x36400000 physical.
 		 */
 		otgphy: phy@6000000 {
-			compatible = "apple,s5l8940x-otgphy";
+			compatible = "apple,s5l8942x-otgphy", "apple,s5l8940x-otgphy";
 			reg = <0x6000000 0x1000>,	/* otgphyctrl */
 			      <0xf108000 0x1000>;	/* usb-complex */
 			#phy-cells = <1>;
+			clocks = <&refclk24mhz>;
+			clock-names = "ref";
 			hsic-supply = <&wlan_reg_on>;
 			lpo-supply = <&wlan_lpo>;
 			status = "okay";
@@ -630,7 +632,8 @@
 		 * PMGR gates from usb-complex: 87, 88, 89, 90, 91 (5 gates)
 		 * plus main clock ID 292. */
 		dwc2: usb@6100000 {
-			compatible = "apple,s5l8940x-dwc2", "snps,dwc2";
+			compatible = "apple,s5l8942x-dwc2", "apple,s5l8940x-dwc2",
+				     "snps,dwc2";
 			reg = <0x6100000 0x10000>;
 			interrupts = <11>;
 			phys = <&otgphy 0>;
