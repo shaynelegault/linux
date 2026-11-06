@@ -8,6 +8,7 @@
 #include <linux/unaligned.h>
 
 #include "apple-sftl.h"
+#include "apple-sftl-limits.h"
 
 #define TEST_LOGICAL_PAGES 15625016U
 #define TEST_STRIDE 8192U
@@ -414,7 +415,68 @@ static void sftl_test_runtime_failure_stops_reads(struct kunit *test)
 	apple_sftl_free(sftl);
 }
 
+static void sftl_test_page_budget_stops_before_next_read(struct kunit *test)
+{
+	struct apple_sftl_io_limit limit;
+
+	KUNIT_ASSERT_EQ(test, apple_sftl_limit_start(&limit, 2, 1, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_end(&limit, 0, 1), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 2), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_end(&limit, 0, 3), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 4), -E2BIG);
+	KUNIT_EXPECT_EQ(test, limit.reads, 2U);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 5), -EIO);
+	KUNIT_EXPECT_EQ(test, limit.reads, 2U);
+}
+
+static void sftl_test_deadline_stops_before_next_read(struct kunit *test)
+{
+	struct apple_sftl_io_limit limit;
+
+	KUNIT_ASSERT_EQ(test, apple_sftl_limit_start(&limit, 4, 1, 10), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 1000010), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, limit.reads, 0U);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 10), -EIO);
+}
+
+static void sftl_test_one_transaction_deadline_overrun(struct kunit *test)
+{
+	struct apple_sftl_io_limit limit;
+
+	KUNIT_ASSERT_EQ(test, apple_sftl_limit_start(&limit, 4, 1, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 999999), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_end(&limit, 0, 1000000), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 1000001), -EIO);
+	KUNIT_EXPECT_EQ(test, limit.reads, 1U);
+}
+
+static void sftl_test_provider_failure_is_sticky(struct kunit *test)
+{
+	struct apple_sftl_io_limit limit;
+
+	KUNIT_ASSERT_EQ(test, apple_sftl_limit_start(&limit, 4, 1, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 0), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_end(&limit, -EBADMSG, 1), -EBADMSG);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_begin(&limit, 2), -EIO);
+	KUNIT_EXPECT_EQ(test, limit.reads, 1U);
+}
+
+static void sftl_test_invalid_reader_policy(struct kunit *test)
+{
+	struct apple_sftl_io_limit limit;
+
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_start(&limit, 0, 1, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_start(&limit, 1, 0, 0), -EINVAL);
+	KUNIT_EXPECT_EQ(test, apple_sftl_limit_start(&limit, 1, 1, ~0ULL), -EINVAL);
+}
+
 static struct kunit_case apple_sftl_cases[] = {
+	KUNIT_CASE(sftl_test_page_budget_stops_before_next_read),
+	KUNIT_CASE(sftl_test_deadline_stops_before_next_read),
+	KUNIT_CASE(sftl_test_one_transaction_deadline_overrun),
+	KUNIT_CASE(sftl_test_provider_failure_is_sticky),
+	KUNIT_CASE(sftl_test_invalid_reader_policy),
 	KUNIT_CASE(sftl_test_complete_medium),
 	KUNIT_CASE(sftl_test_scan_after_open_lane_hole),
 	KUNIT_CASE(sftl_test_runtime_failure_stops_reads),

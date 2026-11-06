@@ -4,18 +4,31 @@
 #include <linux/blkdev.h>
 #include <linux/highmem.h>
 #include <linux/idr.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 
 #include "apple-sftl.h"
+#include "apple-sftl-limits.h"
 
 #define SFTL_BLOCK_NAME "apple-sftl"
 #define SFTL_DISK_MINORS 16
 #define SFTL_LOGICAL_BYTES 4096U
 
+/* Limits bound one manually loaded reader instance, including recovery. */
+static unsigned int max_page_reads = 32768;
+module_param(max_page_reads, uint, 0400);
+MODULE_PARM_DESC(max_page_reads, "Maximum physical page reads per reader instance");
+static unsigned int max_io_time_ms = 600000;
+module_param(max_io_time_ms, uint, 0400);
+MODULE_PARM_DESC(max_io_time_ms, "Maximum reader lifetime in milliseconds");
+
 struct sftl_disk {
+	struct apple_ppn *upstream;
+	struct apple_ppn provider;
+	struct apple_sftl_io_limit limit;
 	struct apple_sftl *ftl;
 	struct blk_mq_tag_set tags;
 	struct gendisk *disk;
@@ -23,6 +36,25 @@ struct sftl_disk {
 	u8 *buffer;
 	unsigned int id;
 	bool dead;
+};
+
+static int sftl_limited_read(void *priv, unsigned int bus, unsigned int cau,
+			     unsigned int block, unsigned int page, bool context,
+			     u8 *data, u8 *oob, u8 *status)
+{
+	struct sftl_disk *sftl = priv;
+	int ret;
+
+	ret = apple_sftl_limit_begin(&sftl->limit, ktime_get_ns());
+	if (ret)
+		return ret;
+	ret = sftl->upstream->ops->read_page(sftl->upstream->priv, bus, cau,
+					   block, page, context, data, oob, status);
+	return apple_sftl_limit_end(&sftl->limit, ret, ktime_get_ns());
+}
+
+static const struct apple_ppn_ops sftl_limited_ops = {
+	.read_page = sftl_limited_read,
 };
 
 static DEFINE_IDA(sftl_disk_ids);
@@ -77,6 +109,8 @@ static blk_status_t sftl_queue_rq(struct blk_mq_hw_ctx *hctx,
 	mutex_lock(&sftl->io_lock);
 	if (sftl->dead) {
 		ret = -ENODEV;
+	} else if ((ret = apple_sftl_limit_check(&sftl->limit, ktime_get_ns()))) {
+		/* Includes logical pages which need no provider transaction. */
 	} else if (req_op(request) == REQ_OP_FLUSH) {
 		/* A read-only device has no buffered writes to flush. */
 	} else if (req_op(request) != REQ_OP_READ) {
@@ -125,9 +159,21 @@ static int sftl_disk_probe(struct platform_device *pdev)
 		ret = -ENOMEM;
 		goto free_state;
 	}
-	ret = apple_sftl_load(provider, &sftl->ftl);
+	sftl->upstream = provider;
+	sftl->provider = *provider;
+	sftl->provider.ops = &sftl_limited_ops;
+	sftl->provider.priv = sftl;
+	ret = apple_sftl_limit_start(&sftl->limit, max_page_reads,
+				     max_io_time_ms, ktime_get_ns());
 	if (ret)
 		goto free_buffer;
+	dev_info(&pdev->dev, "reader policy: %u page reads, %u ms\n",
+		 max_page_reads, max_io_time_ms);
+	ret = apple_sftl_load(&sftl->provider, &sftl->ftl);
+	if (ret)
+		goto free_buffer;
+	dev_info(&pdev->dev, "recovery completed after %u physical page reads\n",
+		 sftl->limit.reads);
 	apple_sftl_get_info(sftl->ftl, &info);
 	if (!info.disk_pages || info.disk_pages > info.logical_pages) {
 		ret = -EINVAL;
@@ -176,6 +222,9 @@ free_id:
 free_ftl:
 	apple_sftl_free(sftl->ftl);
 free_buffer:
+	if (sftl->limit.failed)
+		dev_err(&pdev->dev, "reader stopped after %u page requests: %d\n",
+			sftl->limit.reads, ret);
 	kfree(sftl->buffer);
 free_state:
 	kfree(sftl);
@@ -187,6 +236,8 @@ static void sftl_disk_remove(struct platform_device *pdev)
 	struct sftl_disk *sftl = platform_get_drvdata(pdev);
 
 	mutex_lock(&sftl->io_lock);
+	dev_info(&pdev->dev, "reader retired after %u physical page reads; failed=%u\n",
+		 sftl->limit.reads, sftl->limit.failed);
 	sftl->dead = true;
 	mutex_unlock(&sftl->io_lock);
 	/* del_gendisk freezes and drains the queue before the provider is freed. */
@@ -211,6 +262,8 @@ static int __init sftl_init(void)
 {
 	int ret;
 
+	if (!max_page_reads || !max_io_time_ms)
+		return -EINVAL;
 	sftl_major = register_blkdev(0, SFTL_BLOCK_NAME);
 	if (sftl_major < 0)
 		return sftl_major;

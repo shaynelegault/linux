@@ -46,6 +46,16 @@ frontend freezes and drains requests during removal. Its request buffer is
 allocated before the disk becomes visible, while blocking requests serialize
 access to that buffer and the provider.
 
+The reader has finite operating limits. ``max_page_reads`` defaults to
+32,768 physical page requests and ``max_io_time_ms`` defaults to ten minutes
+from probe. Both are read-only module parameters and must be positive.
+Recovery and subsequent block reads consume the same budget. A limit check
+runs before each provider call; completion also checks the deadline, so an
+existing bounded provider transaction is the maximum overrun. Any provider
+failure or exhausted limit permanently stops that reader instance. These
+limits support bounded read-only qualification; a mounted root must not rely
+on an instance after its operating budget expires.
+
 Tests
 -----
 
