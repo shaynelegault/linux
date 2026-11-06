@@ -56,6 +56,11 @@ The transaction advances through explicit receipt checks:
 * A fresh recovery snapshot must contain the planned whole-device mapping
   and the new checkpoint sequence. Equivalent coalescing is accepted.
 
+The supplied blank, reserved and lane descriptions are trusted inputs. They
+must come from authoritative VFL and context ownership checks before any
+future destructive IO can use a plan. The present receipt checks cannot
+establish those physical ownership facts.
+
 A mismatched receipt moves the transaction to its failed state. Even a victim
 with zero current references must pass checkpoint and cold-recovery stages,
 since the current replay contract can still require its obsolete history.
@@ -67,14 +72,23 @@ Outstanding native protocol work
 
 VFL recovery uses two context groups with four copies per group on this
 profile. The native rotation routine at ``0x810a1b68`` checks references into
-the target group before reuse, copies required lane tables and writes a final
-checkpoint page. Its interruption and replacement paths require further
-tracing before a runtime writer can reproduce them.
+the target group before reuse. On its healthy path, it erases the target
+members in SLC view and writes an initial ff/ff checkpoint retaining references
+to the old lane tables. It then copies those tables, updates the references
+and writes a final ff/ff checkpoint. The old source bank survives this path.
+The initial write at 0x810a1e5a and final write at 0x810a1e34 are separate
+persisted steps. Torn-copy selection, retirement and replacement paths still
+require tracing before a runtime writer can reproduce them.
 
 Offline execution of the pinned native iBEC erase queue establishes queued
-67/D7 commands, final-row 6A/D7, 79 polling and 77/7D completion. Linking its
-row construction to the 64 GB erase granule remains open, along with timeout,
-retirement and partial completion across CAUs. The provider exposes no erase
+67/D7 commands, final-row 6A/D7, 79 polling and 77/7D completion. The native single-block
+wrapper at 0x9ff09a0c shifts the block coordinate by the package's page-address
+bit count. The 13G36 provider builder at 0x8109de94 also supplies CAU and view
+fields. Both saved parameter copies agree: page bits 7, block bits 12 and CAU
+bits 3. A normal block's page-0 row is ``(cau << 19) | (block << 7)``; the SLC
+view adds bit 22. The normal view reports 128 pages per block. Physical erase
+effects, the SLC alias relationship, timeout, retirement and partial completion
+across CAUs remain unqualified. The provider exposes no erase
 callback. Enabling physical reclamation requires resolving those semantics
 and qualifying the exact candidate with device recovery and interruption
 checks.
