@@ -32,6 +32,7 @@
 #include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mtd/apple-ppn.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
@@ -102,6 +103,7 @@ struct h2fmi {
 	struct mtd_info *mtd;
 	struct h2fmi_die *die;
 	unsigned int ndies;
+	struct platform_device *sftl;
 };
 
 /*
@@ -398,6 +400,73 @@ static int h2fmi_read_page_at(struct mtd_info *mtd, loff_t from,
 	return ret;
 }
 
+/* Canonical normal/context reads share the same complete transaction lock. */
+static int h2fmi_ppn_read(void *priv, unsigned int bus, unsigned int cau,
+			unsigned int block, unsigned int page, bool context,
+			u8 *data, u8 *oob, u8 *status)
+{
+	struct h2fmi *fmi = priv;
+	struct h2fmi_bus *b;
+	u32 row;
+	int ret;
+
+	if (bus >= H2FMI_BUSES || !data || !oob || !status)
+		return -EINVAL;
+	b = &fmi->bus[bus];
+	if (context)
+		ret = h2fmi_slc_row(&b->geometry, cau, block, page, &row);
+	else
+		ret = h2fmi_page_row(&b->geometry, cau, block, page, &row);
+	if (ret)
+		return ret;
+
+	/* Retired pages have no data phase. Never return a stale page buffer. */
+	memset(data, 0, H2FMI_PAGE_DATA);
+	memset(oob, 0, H2FMI_PAGE_OOB);
+	mutex_lock(&b->lock);
+	ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row, 4,
+				     b->page, H2FMI_PAGE_RAW, status);
+	if (!ret && h2fmi_page_status(*status) >= 0) {
+		if (*status == PPN_ST_ERASED && memchr_inv(b->page, 0xff, H2FMI_PAGE_RAW))
+			ret = -EIO;
+		else
+			h2fmi_split_page(b->page, data, oob);
+	} else if (!ret && *status != PPN_ST_RETIRED) {
+		ret = -EIO;
+	}
+	mutex_unlock(&b->lock);
+	return ret;
+}
+
+static const struct apple_ppn_ops h2fmi_ppn_ops = {
+	.read_page = h2fmi_ppn_read,
+};
+
+static int h2fmi_register_sftl(struct h2fmi *fmi)
+{
+	const struct h2fmi_geometry *g = &fmi->bus[0].geometry;
+	struct apple_ppn provider = {
+		.dev = fmi->dev,
+		.ops = &h2fmi_ppn_ops,
+		.priv = fmi,
+		.buses = H2FMI_BUSES,
+		.caus = g->caus,
+		.blocks = g->blocks,
+		.pages = g->pages,
+	};
+
+	/* This recovery implementation supports the measured 64 GB profile. */
+	if (!IS_ENABLED(CONFIG_MTD_APPLE_SFTL) || g->caus != 8 ||
+	    g->blocks != 2088 || g->pages != 128 || g->slc_pages != 64)
+		return 0;
+	fmi->sftl = platform_device_register_data(fmi->dev, "apple-sftl",
+						 PLATFORM_DEVID_AUTO,
+						 &provider, sizeof(provider));
+	if (IS_ERR(fmi->sftl))
+		return PTR_ERR(fmi->sftl);
+	return 0;
+}
+
 /*
  * Turn the PPN's status byte into what MTD expects back from _read_oob: a
  * count of corrected bitflips, or a negative errno.
@@ -641,6 +710,13 @@ static int h2fmi_probe(struct platform_device *pdev)
 		}
 	}
 
+	ret = h2fmi_register_sftl(fmi);
+	if (ret) {
+		for (i = 0; i < fmi->ndies; i++)
+			mtd_device_unregister(&fmi->mtd[i]);
+		return ret;
+	}
+
 	platform_set_drvdata(pdev, fmi);
 	dev_info(&pdev->dev, "%u CAUs, %u blocks of %u KiB each\n",
 		 fmi->ndies, fmi->bus[0].geometry.blocks,
@@ -653,6 +729,8 @@ static void h2fmi_remove(struct platform_device *pdev)
 	struct h2fmi *fmi = platform_get_drvdata(pdev);
 	int i;
 
+	if (fmi->sftl)
+		platform_device_unregister(fmi->sftl);
 	for (i = 0; i < fmi->ndies; i++)
 		mtd_device_unregister(&fmi->mtd[i]);
 }
