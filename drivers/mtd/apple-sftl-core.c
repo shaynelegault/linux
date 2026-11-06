@@ -20,6 +20,7 @@
 #include <linux/vmalloc.h>
 
 #include "apple-sftl.h"
+#include "apple-sftl-reclaim.h"
 
 #define SFTL_LPAGES	15625016U
 #define SFTL_DISK_PAGES	15625000U
@@ -59,10 +60,11 @@ struct sftl_member {
 struct apple_sftl {
 	struct apple_ppn *ppn;
 	struct rb_root runs;
+	struct sftl_records context;
 	u32 nr_runs;
 	u16 lanes[SFTL_BLOCKS];
 	DECLARE_BITMAP(reserved, SFTL_BLOCKS);
-	u64 checkpoint_sequence, sequence;
+	u64 checkpoint_sequence, sequence, journal_sequence;
 	u8 *page;
 	u8 oob[APPLE_PPN_OOB_SIZE];
 	struct mutex lock; /* serializes reads and the shared page buffer */
@@ -607,6 +609,17 @@ static int sftl_context(struct apple_sftl *sftl, const u8 *heads)
 	}
 	if (cursor != SFTL_LPAGES || !fragment_sequence)
 		goto out;
+	/* Retain compact references so an explicit snapshot can preserve opaque data. */
+	for (i = first; i < records.count; i++) {
+		const struct sftl_record *record = &records.items[i];
+
+		if (sftl_flags(record) == 4)
+			continue;
+		ret = sftl_record_add(&sftl->context, record->stamp, record->key,
+				      record->address);
+		if (ret)
+			goto out;
+	}
 	sftl->checkpoint_sequence = fragment_sequence;
 	sftl->sequence = fragment_sequence;
 	ret = 0;
@@ -808,6 +821,7 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads)
 		}
 		sftl->sequence = sequence;
 	}
+	sftl->journal_sequence = sftl->sequence;
 	sftl->sequence = max(sftl->sequence, floor);
 	ret = 0;
 out:
@@ -890,6 +904,7 @@ void apple_sftl_free(struct apple_sftl *sftl)
 		rb_erase(node, &sftl->runs);
 		kfree(rb_entry(node, struct sftl_run, node));
 	}
+	kvfree(sftl->context.items);
 	kfree(sftl->page);
 	kfree(sftl);
 }
@@ -947,3 +962,80 @@ void apple_sftl_get_info(struct apple_sftl *sftl, struct apple_sftl_info *info)
 	info->sequence = sftl->sequence;
 }
 EXPORT_SYMBOL_GPL(apple_sftl_get_info);
+
+int apple_sftl_snapshot(struct apple_sftl *sftl, size_t max_bytes,
+			struct apple_sftl_snapshot **out)
+{
+	struct apple_sftl_snapshot *snapshot;
+	struct rb_node *node;
+	size_t map_bytes, context_bytes;
+	u32 i = 0;
+	unsigned int chunk;
+	int ret = 0;
+
+	if (!out)
+		return -EINVAL;
+	*out = NULL;
+	if (!sftl)
+		return -EINVAL;
+	mutex_lock(&sftl->lock);
+	if (sftl->failed) {
+		ret = -EIO;
+		goto unlock;
+	}
+	map_bytes = array_size(sftl->nr_runs, sizeof(*snapshot->runs));
+	context_bytes = array_size(sftl->context.count, sizeof(*snapshot->opaque));
+	if (map_bytes > max_bytes || context_bytes > max_bytes - map_bytes) {
+		ret = -ENOSPC;
+		goto unlock;
+	}
+	snapshot = kzalloc(sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	snapshot->runs = kvzalloc(map_bytes, GFP_KERNEL);
+	snapshot->opaque = kvzalloc(context_bytes, GFP_KERNEL);
+	if (!snapshot->runs || !snapshot->opaque) {
+		ret = -ENOMEM;
+		goto failed;
+	}
+	for (node = rb_first(&sftl->runs); node; node = rb_next(node)) {
+		const struct sftl_run *run = rb_entry(node, struct sftl_run, node);
+
+		snapshot->runs[i++] = (struct apple_sftl_extent) {
+			.logical = run->start, .length = run->end - run->start,
+			.provider = run->provider,
+		};
+	}
+	for (i = 0; i < sftl->context.count; i++) {
+		const struct sftl_record *reference = &sftl->context.items[i];
+		struct apple_sftl_context_record *record = &snapshot->opaque[i];
+
+		ret = sftl_read_address(sftl, reference->address, &chunk);
+		if (ret) {
+			sftl->failed = true;
+			goto failed;
+		}
+		if (sftl_stamp(sftl->oob + chunk * SFTL_META) != reference->stamp) {
+			ret = -EBADMSG;
+			sftl->failed = true;
+			goto failed;
+		}
+		memcpy(record->meta, sftl->oob + chunk * SFTL_META, SFTL_META);
+		memcpy(record->data, sftl->page + chunk * SFTL_CHUNK, SFTL_CHUNK);
+	}
+	snapshot->nr_runs = sftl->nr_runs;
+	snapshot->nr_opaque = sftl->context.count;
+	snapshot->sequence = sftl->sequence;
+	snapshot->journal_sequence = sftl->journal_sequence;
+	snapshot->checkpoint_sequence = sftl->checkpoint_sequence;
+	*out = snapshot;
+	goto unlock;
+failed:
+	apple_sftl_snapshot_free(snapshot);
+unlock:
+	mutex_unlock(&sftl->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sftl_snapshot);

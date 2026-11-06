@@ -8,6 +8,7 @@
 #include <linux/unaligned.h>
 
 #include "apple-sftl.h"
+#include "apple-sftl-reclaim.h"
 
 #define TEST_LOGICAL_PAGES 15625016U
 #define TEST_STRIDE 8192U
@@ -40,6 +41,7 @@ struct sftl_fixture {
 	struct apple_ppn provider;
 	enum sftl_fault fault;
 	unsigned int reads;
+	struct apple_sftl_checkpoint *checkpoint;
 };
 
 static void sftl_test_meta(u8 *meta, u8 kind, u8 flags, u64 seq, u32 key)
@@ -208,7 +210,18 @@ static int sftl_test_read_page(void *priv, unsigned int bus, unsigned int cau,
 		return -EIO;
 	if (lane > 1)
 		return 0;
-	if (block == 1 && !position) {
+	if (block == 1 && f->checkpoint && position < f->checkpoint->count / 4) {
+		unsigned int i;
+
+		for (i = 0; i < 4; i++) {
+			const struct apple_sftl_context_record *r;
+
+			r = &f->checkpoint->records[position * 4 + i];
+
+			memcpy(data + i * 4096, r->data, 4096);
+			memcpy(oob + i * 16, r->meta, 16);
+		}
+	} else if (block == 1 && !position) {
 		sftl_test_checkpoint(f, data, oob);
 	} else if (block == 2 && !position) {
 		sftl_test_open(f, data, oob);
@@ -414,8 +427,39 @@ static void sftl_test_runtime_failure_stops_reads(struct kunit *test)
 	apple_sftl_free(sftl);
 }
 
+static void sftl_test_checkpoint_cold_roundtrip(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl_snapshot *before = NULL, *after = NULL;
+	struct apple_sftl_checkpoint *checkpoint = NULL;
+	struct apple_sftl *sftl = NULL;
+	u32 blocks[] = { 1 };
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_snapshot(sftl, 1, &before), -ENOSPC);
+	KUNIT_EXPECT_PTR_EQ(test, before, NULL);
+	KUNIT_ASSERT_EQ(test, apple_sftl_snapshot(sftl, 65536, &before), 0);
+	apple_sftl_free(sftl);
+	sftl = NULL;
+	KUNIT_ASSERT_EQ(test, apple_sftl_checkpoint_build(before, blocks, 1, 16, &checkpoint), 0);
+	f->checkpoint = checkpoint;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	KUNIT_ASSERT_EQ(test, apple_sftl_snapshot(sftl, 65536, &after), 0);
+	KUNIT_EXPECT_EQ(test, after->checkpoint_sequence, checkpoint->sequence);
+	KUNIT_EXPECT_EQ(test, after->nr_runs, before->nr_runs);
+	KUNIT_EXPECT_MEMEQ(test, after->runs, before->runs,
+			   before->nr_runs * sizeof(*before->runs));
+	KUNIT_EXPECT_MEMEQ(test, after->opaque[0].data, before->opaque[0].data, 4096);
+	apple_sftl_free(sftl);
+	apple_sftl_snapshot_free(after);
+	apple_sftl_snapshot_free(before);
+	apple_sftl_checkpoint_free(checkpoint);
+}
+
 static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_complete_medium),
+	KUNIT_CASE(sftl_test_checkpoint_cold_roundtrip),
 	KUNIT_CASE(sftl_test_scan_after_open_lane_hole),
 	KUNIT_CASE(sftl_test_runtime_failure_stops_reads),
 	KUNIT_CASE(sftl_test_reject_incomplete_or_ambiguous),
