@@ -11,6 +11,10 @@ struct device;
 
 /* All buffers have canonical data/OOB layout, including context reads. */
 struct apple_ppn_ops {
+	/* Success means the complete page and metadata passed exact readback. */
+	int (*program_page)(void *priv, unsigned int bus, unsigned int cau,
+			    unsigned int block, unsigned int page,
+			    const u8 *data, const u8 *oob);
 	int (*read_page)(void *priv, unsigned int bus, unsigned int cau,
 			 unsigned int block, unsigned int page, bool context,
 			 u8 *data, u8 *oob, u8 *status);

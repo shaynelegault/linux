@@ -671,8 +671,20 @@ static int h2fmi_ppn_read(void *priv, unsigned int bus, unsigned int cau,
 	return ret;
 }
 
+static int h2fmi_ppn_program(void *priv, unsigned int bus, unsigned int cau,
+			     unsigned int block, unsigned int page,
+			     const u8 *data, const u8 *oob)
+{
+	struct h2fmi *fmi = priv;
+
+	if (bus >= H2FMI_BUSES)
+		return -EINVAL;
+	return h2fmi_program_page(fmi, &fmi->bus[bus], cau, block, page, data, oob);
+}
+
 static const struct apple_ppn_ops h2fmi_ppn_ops = {
 	.read_page = h2fmi_ppn_read,
+	.program_page = h2fmi_ppn_program,
 };
 
 static int h2fmi_register_sftl(struct h2fmi *fmi)
