@@ -207,7 +207,7 @@ config MTD_PARTITIONED_MASTER
 	  what lies behind the master.
 
 config MTD_APPLE_SFTL
-	tristate "Apple PPN read-only VFL/SwissPPNFTL translation"
+	tristate "Apple PPN VFL/SwissPPNFTL translation"
 	depends on BLOCK
 	help
 	  Recover the logical block medium stored in Apple VFL/SwissPPNFTL
@@ -216,16 +216,35 @@ config MTD_APPLE_SFTL
 	  Unsupported checkpoints, missing journal sequences and refresh
 	  requirements stop recovery before a disk is registered.
 
-	  The disk is read-only. This driver performs no program or erase.
+	  The disk is read-only unless experimental append writes are enabled.
+	  This driver performs no erase.
+
+config MTD_APPLE_SFTL_WRITE
+	bool "Apple PPN append writes (EXPERIMENTAL)"
+	depends on MTD_APPLE_SFTL && MTD_APPLE_H2FMI_WRITE
+	default n
+	help
+	  Append complete physical pages in verified blank blocks while retaining
+	  Apple VFL/SFTL metadata and native block summaries. The controller must
+	  complete and verify each program before the mapping is published.
+	  The shared map and saved-context blocks remain reserved. No erase or
+	  reclamation is available; exhausted blank space returns ENOSPC.
+
+	  Recovery and the installer must fence Apple logical partitions. This
+	  option is experimental and does not qualify sustained writes or all
+	  power-interruption cases. If unsure, say N.
 
 config MTD_APPLE_SFTL_KUNIT_TEST
-	tristate "KUnit tests for Apple VFL/SwissPPNFTL recovery" if !KUNIT_ALL_TESTS
+	tristate "KUnit tests for Apple VFL/SwissPPNFTL" if !KUNIT_ALL_TESTS
 	depends on KUNIT && MTD_APPLE_SFTL
 	default KUNIT_ALL_TESTS
 	help
 	  Synthesize complete VFL/SFTL media and exercise checkpoint recovery,
 	  native block summaries and open-block journal replay. Malformed
 	  replicas and unsupported layouts must fail without storage writes.
+	  With experimental append writes enabled, also test complete programs,
+	  interrupted summaries, allocation limits and fresh-loader replay.
+	  All test media and provider operations are synthetic.
 
 source "drivers/mtd/chips/Kconfig"
 

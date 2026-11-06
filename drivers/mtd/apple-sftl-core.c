@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple VFL/SwissPPNFTL read-only recovery for the measured 64 GB PPN layout.
+ * Apple VFL/SwissPPNFTL recovery and append for the measured 64 GB PPN layout.
  *
  * Format and replay rules are ported from Orchard's P105 Python reference
- * (ftl_map.py, ftl_load.py and ftl_log.py). That implementation was checked
+ * (ftl_map.py, ftl_load.py, ftl_log.py and ftl_append.py). It was checked
  * against native iOS logical reads. This code contains no captured firmware
  * or device data. Unsupported formats fail before a block device is created.
  */
 #include <linux/bitops.h>
 #include <linux/errno.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -34,6 +35,9 @@
 #define SFTL_META	16U
 #define SFTL_CHUNK	4096U
 #define SFTL_TRIM	0xffff0001U
+#define SFTL_FOOTER_CHUNKS 32U
+#define SFTL_CLAIM_TIMEOUT (500U * HZ)
+#define SFTL_FOOTER_BYTES (SFTL_FOOTER_CHUNKS * SFTL_CHUNK)
 
 struct sftl_run {
 	struct rb_node node;
@@ -62,7 +66,15 @@ struct apple_sftl {
 	u32 nr_runs;
 	u16 lanes[SFTL_BLOCKS];
 	DECLARE_BITMAP(reserved, SFTL_BLOCKS);
-	u64 checkpoint_sequence, sequence;
+	DECLARE_BITMAP(vfl_reserved, SFTL_BLOCKS);
+	u64 checkpoint_sequence, sequence, journal_sequence;
+	DECLARE_BITMAP(candidates, SFTL_BLOCKS);
+	DECLARE_BITMAP(used, SFTL_BLOCKS);
+	u32 next_candidate, append_block, append_position, append_capacity;
+	u32 footer_runs;
+	u64 append_base;
+	u8 *footer;
+	bool writer_prepared;
 	u8 *page;
 	u8 oob[APPLE_PPN_OOB_SIZE];
 	struct mutex lock; /* serializes reads and the shared page buffer */
@@ -375,6 +387,7 @@ static int sftl_vfl(struct apple_sftl *sftl)
 				ret = -EBADMSG;
 				goto out;
 			}
+		__set_bit(members[member].block, sftl->vfl_reserved);
 	}
 	for (member = 0; member < 8; member++) {
 		for (page = 0; page < 64; page++) {
@@ -646,7 +659,7 @@ static int sftl_footer(struct apple_sftl *sftl, const u8 *head, u32 block,
 	span = get_unaligned_le32(footer_meta + 8);
 	if (chunks < 4 || chunks > 32 || chunks % 4 || footer_meta[1] >> 1 != chunks ||
 	    get_unaligned_le16(footer_meta + 14) != 0xffff ||
-	    base != sftl_sequence(head) || !span || base + span > SFTL_SEQUENCE)
+	    base != sftl_sequence(head) || !span || base + span > SFTL_SEQUENCE + 1)
 		return -EBADMSG;
 	*floor = max(*floor, base + span - 1);
 	if (base + span - 1 <= sftl->checkpoint_sequence)
@@ -722,6 +735,25 @@ out:
 	return ret;
 }
 
+static bool sftl_partial_footer(struct apple_sftl *sftl, const u8 *head,
+				u32 position, u32 pages)
+{
+	const u8 *meta = sftl->oob;
+	unsigned int chunk;
+
+	if (position < pages - SFTL_FOOTER_CHUNKS / 4 ||
+	    meta[0] != 0x1c || meta[1] != SFTL_FOOTER_CHUNKS * 2 ||
+	    sftl_sequence(meta) != sftl_sequence(head) ||
+	    get_unaligned_le32(meta + 8) != pages * 4 - SFTL_FOOTER_CHUNKS ||
+	    get_unaligned_le16(meta + 12) != SFTL_FOOTER_CHUNKS ||
+	    get_unaligned_le16(meta + 14) != 0xffff)
+		return false;
+	for (chunk = 1; chunk < 4; chunk++)
+		if (memcmp(meta, sftl->oob + chunk * SFTL_META, SFTL_META))
+			return false;
+	return true;
+}
+
 static int sftl_journal(struct apple_sftl *sftl, const u8 *heads)
 {
 	struct sftl_records journal = {};
@@ -732,6 +764,7 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads)
 
 	for (block = 1; block < SFTL_SUBBLOCKS; block++) {
 		const u8 *head = heads + block * SFTL_META;
+		bool complete_prefix = true, partial_footer = false;
 
 		if (head[0] != 1 && head[0] != 2)
 			continue;
@@ -756,6 +789,33 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads)
 				goto out;
 			if (sftl_erased(sftl->oob, sizeof(sftl->oob)) &&
 			    !sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE)) {
+				ret = -EBADMSG;
+				goto out;
+			}
+			if (position < pages - SFTL_FOOTER_CHUNKS / 4) {
+				for (chunk = 0; chunk < 4; chunk++) {
+					const u8 *meta = sftl->oob + chunk * SFTL_META;
+					u64 sequence = sftl_sequence(head) + position * 4 + chunk;
+
+					if (meta[0] != 1 || meta[1] ||
+					    sftl_sequence(meta) != sequence ||
+					    get_unaligned_le32(meta + 12) != sequence >> 16)
+						complete_prefix = false;
+				}
+			}
+			/* An incomplete final summary leaves the last page erased.
+			 * Its full contiguous data prefix must still validate directly.
+			 * The partially written summary payload is never trusted.
+			 */
+			if (sftl_partial_footer(sftl, head, position, pages)) {
+				if (!complete_prefix) {
+					ret = -EBADMSG;
+					goto out;
+				}
+				partial_footer = true;
+				continue;
+			}
+			if (partial_footer && !sftl_erased(sftl->oob, sizeof(sftl->oob))) {
 				ret = -EBADMSG;
 				goto out;
 			}
@@ -808,6 +868,7 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads)
 		}
 		sftl->sequence = sequence;
 	}
+	sftl->journal_sequence = expected - 1;
 	sftl->sequence = max(sftl->sequence, floor);
 	ret = 0;
 out:
@@ -835,6 +896,8 @@ int apple_sftl_load(struct apple_ppn *provider, struct apple_sftl **out)
 		return -ENOMEM;
 	sftl->ppn = provider;
 	sftl->runs = RB_ROOT;
+	sftl->append_block = U32_MAX;
+	sftl->next_candidate = 1;
 	mutex_init(&sftl->lock);
 	sftl->page = kmalloc(APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
 	heads = kcalloc(SFTL_BLOCKS, SFTL_META, GFP_KERNEL);
@@ -857,6 +920,7 @@ int apple_sftl_load(struct apple_ppn *provider, struct apple_sftl **out)
 				ret = -EBADMSG;
 				goto failed;
 			}
+			__set_bit(block, sftl->candidates);
 		} else if (sftl->oob[0] == 0x1f || sftl->oob[0] == 1 || sftl->oob[0] == 2) {
 			memcpy(heads + block * SFTL_META, sftl->oob, SFTL_META);
 		} else {
@@ -890,6 +954,7 @@ void apple_sftl_free(struct apple_sftl *sftl)
 		rb_erase(node, &sftl->runs);
 		kfree(rb_entry(node, struct sftl_run, node));
 	}
+	kvfree(sftl->footer);
 	kfree(sftl->page);
 	kfree(sftl);
 }
@@ -938,6 +1003,244 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_sftl_read);
 
+/* Caller holds sftl->lock. Every candidate is checked in full before use. */
+static int sftl_writer_prepare(struct apple_sftl *sftl)
+{
+	struct rb_node *node;
+	u32 block;
+
+	if (sftl->writer_prepared)
+		return 0;
+	if (sftl->journal_sequence != sftl->sequence)
+		return -EOPNOTSUPP;
+	if (!sftl->ppn->ops->program_page)
+		return -EROFS;
+	sftl->footer = kvzalloc(SFTL_FOOTER_BYTES, GFP_KERNEL);
+	if (!sftl->footer)
+		return -ENOMEM;
+	for (block = 0; block < SFTL_BLOCKS; block++)
+		if (test_bit(block, sftl->reserved) || test_bit(block, sftl->vfl_reserved))
+			__set_bit(block, sftl->used);
+	__set_bit(0, sftl->used);
+	__set_bit(SFTL_SUBBLOCKS, sftl->used);
+	__set_bit(SFTL_SUBBLOCKS + 1, sftl->used);
+	for (node = rb_first(&sftl->runs); node; node = rb_next(node)) {
+		struct sftl_run *run = rb_entry(node, struct sftl_run, node);
+		u32 end;
+
+		if (run->provider == SFTL_UNMAPPED)
+			continue;
+		end = (run->provider + run->end - run->start - 1) / SFTL_STRIDE;
+		for (block = run->provider / SFTL_STRIDE; block <= end; block++)
+			__set_bit(block, sftl->used);
+	}
+	sftl->writer_prepared = true;
+	return 0;
+}
+
+static int sftl_claim_block(struct apple_sftl *sftl)
+{
+	unsigned long deadline = jiffies + SFTL_CLAIM_TIMEOUT;
+	u32 block;
+
+	while (sftl->next_candidate < SFTL_SUBBLOCKS) {
+		u32 capacity, position;
+		unsigned int chunk;
+		bool blank = true;
+		int ret;
+
+		block = sftl->next_candidate++;
+		if (!test_bit(block, sftl->candidates) ||
+		    test_bit(block, sftl->used) || !sftl->lanes[block])
+			continue;
+		/* A checked or rejected candidate is never reused in this instance. */
+		__set_bit(block, sftl->used);
+		capacity = hweight16(sftl->lanes[block]) * 128 * 4;
+		for (position = 0; position < capacity; position += 4) {
+			if (time_after_eq(jiffies, deadline)) {
+				sftl->failed = true;
+				return -ETIMEDOUT;
+			}
+			ret = sftl_read_address(sftl, block * SFTL_STRIDE + position, &chunk);
+			if (ret) {
+				sftl->failed = true;
+				return ret;
+			}
+			if (!sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE) ||
+			    !sftl_erased(sftl->oob, APPLE_PPN_OOB_SIZE)) {
+				blank = false;
+				break;
+			}
+		}
+		if (!blank)
+			continue;
+		sftl->append_block = block;
+		sftl->append_capacity = capacity - SFTL_FOOTER_CHUNKS;
+		sftl->append_position = 0;
+		sftl->append_base = sftl->sequence + 1;
+		sftl->footer_runs = 0;
+		memset(sftl->footer, 0, SFTL_FOOTER_BYTES);
+		return 0;
+	}
+	return -ENOSPC;
+}
+
+static int sftl_program_address(struct apple_sftl *sftl, u32 address,
+				const u8 *data, const u8 *oob)
+{
+	unsigned int bus, cau, block, page, chunk;
+	int ret;
+
+	ret = sftl_translate(sftl, address, &bus, &cau, &block, &page, &chunk);
+	if (ret)
+		return ret;
+	if (chunk)
+		return -EINVAL;
+	return sftl->ppn->ops->program_page(sftl->ppn->priv, bus, cau,
+					    block, page, data, oob);
+}
+
+/* A short request repeats its final logical page to fill the program unit. */
+static void sftl_data_meta(u8 *meta, u64 sequence, u32 logical_page)
+{
+	put_unaligned_le64(sequence << 16 | 1, meta);
+	put_unaligned_le32(logical_page, meta + 8);
+	put_unaligned_le32(sequence >> 16, meta + 12);
+}
+
+static void sftl_append_summary(struct apple_sftl *sftl, u64 sequence, u32 key)
+{
+	u32 relative = sequence - sftl->append_base;
+	u32 high = sequence >> 16;
+	u8 *entry;
+
+	if (sftl->footer_runs) {
+		u32 length;
+
+		entry = sftl->footer + (sftl->footer_runs - 1) * SFTL_META;
+		length = get_unaligned_le32(entry + 12);
+		if (key < 0xffff0000 && get_unaligned_le32(entry + 4) == high &&
+		    get_unaligned_le32(entry) + length == relative &&
+		    get_unaligned_le32(entry + 8) + length == key) {
+			put_unaligned_le32(length + 1, entry + 12);
+			return;
+		}
+	}
+	entry = sftl->footer + sftl->footer_runs++ * SFTL_META;
+	put_unaligned_le32(relative, entry);
+	put_unaligned_le32(high, entry + 4);
+	put_unaligned_le32(key, entry + 8);
+	put_unaligned_le32(1, entry + 12);
+}
+
+static int sftl_close_block(struct apple_sftl *sftl)
+{
+	u8 meta[SFTL_META];
+	unsigned int chunk, index;
+	int ret;
+
+	put_unaligned_le64(sftl->append_base << 16 | 0x401c, meta);
+	put_unaligned_le32(sftl->append_position, meta + 8);
+	put_unaligned_le16(SFTL_FOOTER_CHUNKS, meta + 12);
+	put_unaligned_le16(0xffff, meta + 14);
+	for (chunk = 0; chunk < 4; chunk++)
+		memcpy(sftl->oob + chunk * SFTL_META, meta, SFTL_META);
+	for (index = 0; index < SFTL_FOOTER_CHUNKS / 4; index++) {
+		u32 address = sftl->append_block * SFTL_STRIDE +
+			      sftl->append_capacity + index * 4;
+
+		ret = sftl_program_address(sftl, address,
+					   sftl->footer + index * APPLE_PPN_PAGE_SIZE,
+					   sftl->oob);
+		if (ret)
+			return ret;
+	}
+	sftl->append_block = U32_MAX;
+	return 0;
+}
+
+int apple_sftl_write(struct apple_sftl *sftl, u32 logical_page,
+		     const u8 *data, unsigned int count)
+{
+	u64 first_sequence;
+	u32 address;
+	unsigned int chunk;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_MTD_APPLE_SFTL_WRITE))
+		return -EROFS;
+	if (!sftl || !data || !count || count > 4 || logical_page >= SFTL_DISK_PAGES ||
+	    count > SFTL_DISK_PAGES - logical_page)
+		return -EINVAL;
+	mutex_lock(&sftl->lock);
+	if (sftl->failed) {
+		ret = -EIO;
+		goto out;
+	}
+	if (sftl->sequence > SFTL_SEQUENCE - 4) {
+		ret = -EOVERFLOW;
+		goto out;
+	}
+	ret = sftl_writer_prepare(sftl);
+	if (ret)
+		goto out;
+	if (sftl->append_block == U32_MAX) {
+		ret = sftl_claim_block(sftl);
+		if (ret)
+			goto out;
+	}
+	address = sftl->append_block * SFTL_STRIDE + sftl->append_position;
+	first_sequence = sftl->sequence + 1;
+	for (chunk = 0; chunk < 4; chunk++) {
+		unsigned int index = min(chunk, count - 1);
+
+		memcpy(sftl->page + chunk * SFTL_CHUNK,
+		       data + index * SFTL_CHUNK, SFTL_CHUNK);
+		sftl_data_meta(sftl->oob + chunk * SFTL_META,
+			       first_sequence + chunk, logical_page + index);
+	}
+	ret = sftl_program_address(sftl, address, sftl->page, sftl->oob);
+	if (ret)
+		goto failed;
+	for (chunk = 0; chunk < 4; chunk++) {
+		u32 key = logical_page + min(chunk, count - 1);
+
+		ret = sftl_replace(sftl, key, 1, address + chunk);
+		if (ret)
+			goto failed;
+		sftl_append_summary(sftl, first_sequence + chunk, key);
+	}
+	sftl->sequence += 4;
+	sftl->journal_sequence = sftl->sequence;
+	sftl->append_position += 4;
+	if (sftl->append_position == sftl->append_capacity) {
+		ret = sftl_close_block(sftl);
+		if (ret)
+			goto failed;
+	}
+	goto out;
+failed:
+	sftl->failed = true;
+out:
+	mutex_unlock(&sftl->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sftl_write);
+
+int apple_sftl_flush(struct apple_sftl *sftl)
+{
+	int ret;
+
+	if (!sftl)
+		return -EINVAL;
+	mutex_lock(&sftl->lock);
+	/* Each program is complete and verified before apple_sftl_write returns. */
+	ret = sftl->failed ? -EIO : 0;
+	mutex_unlock(&sftl->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sftl_flush);
+
 void apple_sftl_get_info(struct apple_sftl *sftl, struct apple_sftl_info *info)
 {
 	info->logical_pages = SFTL_LPAGES;
@@ -945,5 +1248,6 @@ void apple_sftl_get_info(struct apple_sftl *sftl, struct apple_sftl_info *info)
 	info->nr_runs = sftl->nr_runs;
 	info->checkpoint_sequence = sftl->checkpoint_sequence;
 	info->sequence = sftl->sequence;
+	info->journal_sequence = sftl->journal_sequence;
 }
 EXPORT_SYMBOL_GPL(apple_sftl_get_info);
