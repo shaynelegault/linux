@@ -6,6 +6,7 @@
 
 #define APPLE_SFTL_CHUNK 4096U
 #define APPLE_SFTL_META 16U
+#define APPLE_SFTL_NATIVE_MAP_BATCH 64U
 #define APPLE_SFTL_STRIDE 8192U
 #define APPLE_SFTL_SUBBLOCKS 2086U
 #define APPLE_SFTL_LOGICAL_PAGES 15625016U
@@ -85,6 +86,26 @@ struct apple_sftl_gc_io {
 	int (*read)(void *priv, u32 address, struct apple_sftl_gc_page *page);
 	int (*program)(void *priv, u32 address, const struct apple_sftl_gc_page *page);
 };
+
+/* Write a prepared context to an exclusively owned, entirely blank block.
+ * All addresses and lengths are in 4 KiB units. A failure may leave a prefix.
+ * The previous generation remains intact throughout this operation.
+ */
+int apple_sftl_checkpoint_stage(const struct apple_sftl_checkpoint *image,
+				u32 block, u16 lanes, const struct apple_sftl_gc_io *io,
+				void *priv, struct apple_sftl_checkpoint **readback);
+
+/* Platform policy must account for the native roles, streams and counters of
+ * the transition, or refuse it before any live data is moved. The two
+ * context blocks are in new-active, old-active order.
+ */
+typedef int (*apple_sftl_prepare_accounting)(void *priv,
+		struct apple_sftl_context_record *opaque, u32 nr_opaque,
+		const struct apple_sftl_snapshot *map, u32 victim, u32 landing,
+		const u32 blocks[2]);
+int apple_sftl_gc_prepare_native(struct apple_sftl_gc *gc,
+		apple_sftl_prepare_accounting prepare, void *priv,
+		const u32 blocks[2], u32 capacity);
 
 /* Planning consumes supplied bytes. Relocation performs verified page I/O. */
 int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,

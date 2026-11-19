@@ -4,8 +4,8 @@
  * Native metadata: 13G36 IOFlashStorage-730 formatter at 0x81092408.
  * Range payload: cxtNextBatch at 0x8108f07c and the recovery decoder.
  *
- * Opaque accounting payloads survive byte-for-byte. Updating their native
- * accounting and committing VFL bank rotation remain separate work.
+ * Map-derived accounting is rebuilt for the measured native envelope.
+ * The platform must account for the other native state before publication.
  */
 #include <linux/bitops.h>
 #include <linux/errno.h>
@@ -17,6 +17,7 @@
 #include <linux/vmalloc.h>
 
 #include "apple-sftl-reclaim.h"
+#include "apple-sftl-account.h"
 
 #define SFTL_SEQUENCE GENMASK_ULL(47, 0)
 #define SFTL_PROVIDER (APPLE_SFTL_SUBBLOCKS * APPLE_SFTL_STRIDE)
@@ -28,6 +29,7 @@ struct apple_sftl_gc {
 	struct apple_sftl_snapshot snapshot;
 	struct apple_sftl_gc_copy *copies;
 	struct apple_sftl_checkpoint *checkpoint;
+	bool issued;
 	u32 nr_copies, copied, max_records, victim, destination;
 	u64 retire_sequence, copied_sequence, victim_sequence;
 	u32 padding;
@@ -85,10 +87,27 @@ static int sftl_check_context(const struct apple_sftl_snapshot *snapshot)
 			return -EBADMSG;
 		previous = order;
 	}
+	/* A four-chunk native base cannot be downgraded to the compact form
+	 * when its geometry or accounting prefix is damaged.
+	 */
+	if (snapshot->nr_opaque >= 4 && snapshot->opaque[3].meta[1] == 1 &&
+	    (snapshot->nr_opaque != APPLE_SFTL_ACCOUNT_RECORDS ||
+	     get_unaligned_le32(snapshot->opaque[3].data + APPLE_SFTL_CHUNK - 4) !=
+		     APPLE_SFTL_SUBBLOCKS))
+		return -EOPNOTSUPP;
 	names = get_unaligned_le32(snapshot->opaque[0].data);
 	if (!names || names > 16)
 		return -EBADMSG;
 	return 0;
+}
+
+static bool sftl_native_context(const struct apple_sftl_snapshot *snapshot)
+{
+	const struct apple_sftl_context_record *base = snapshot->opaque;
+
+	return snapshot->nr_opaque >= 4 && base[0].meta[1] == 1 &&
+		base[1].meta[1] == 1 && base[2].meta[1] == 1 && base[3].meta[1] == 1 &&
+		get_unaligned_le32(base[3].data + APPLE_SFTL_CHUNK - 4) == APPLE_SFTL_SUBBLOCKS;
 }
 
 static int sftl_checkpoint_count(const struct apple_sftl_snapshot *snapshot,
@@ -106,7 +125,12 @@ static int sftl_checkpoint_count(const struct apple_sftl_snapshot *snapshot,
 	ret = sftl_check_context(snapshot);
 	if (ret)
 		return ret;
-	records = snapshot->nr_opaque + (snapshot->nr_runs + SFTL_PAIRS - 1) / SFTL_PAIRS;
+	records = (snapshot->nr_runs + SFTL_PAIRS - 1) / SFTL_PAIRS;
+	/* cxtNextBatch pads the measured 64 GB range stream to whole batches. */
+	if (sftl_native_context(snapshot))
+		records = (records + APPLE_SFTL_NATIVE_MAP_BATCH - 1) &
+			~(APPLE_SFTL_NATIVE_MAP_BATCH - 1);
+	records += snapshot->nr_opaque;
 	records = (records + 3) & ~3U;
 	if (records > max_records)
 		return -ENOSPC;
@@ -203,6 +227,13 @@ int apple_sftl_checkpoint_build(const struct apple_sftl_snapshot *snapshot,
 			put_unaligned_le32(address, record->data + 8 + j * 8);
 			put_unaligned_le32(extent->length, record->data + 12 + j * 8);
 			cursor += extent->length;
+		}
+	}
+	if (sftl_native_context(snapshot)) {
+		ret = apple_sftl_account_map(checkpoint, snapshot);
+		if (ret) {
+			apple_sftl_checkpoint_free(checkpoint);
+			return ret;
 		}
 	}
 	*out = checkpoint;
@@ -447,6 +478,101 @@ static int sftl_gc_program(struct apple_sftl_gc_page *buffer,
 	return memcmp(page, buffer, sizeof(*page)) ? -EBADMSG : 0;
 }
 
+int apple_sftl_checkpoint_stage(const struct apple_sftl_checkpoint *image,
+				u32 block, u16 lanes, const struct apple_sftl_gc_io *io,
+				void *priv, struct apple_sftl_checkpoint **readback)
+{
+	struct apple_sftl_checkpoint *copy;
+	struct apple_sftl_gc_page *pages;
+	u32 capacity = hweight16(lanes) * 512, start = block * APPLE_SFTL_STRIDE;
+	u32 i, j, order = 0;
+	bool native;
+	int ret;
+
+	if (!readback)
+		return -EINVAL;
+	*readback = NULL;
+	if (!image || !image->records || !image->count || image->count % 4 ||
+	    !block || block >= APPLE_SFTL_SUBBLOCKS || image->count > capacity ||
+	    !image->first_sequence || image->sequence > SFTL_SEQUENCE ||
+	    image->first_sequence > image->sequence ||
+	    image->sequence - image->first_sequence != image->count - 1 ||
+	    !io || !io->read || !io->program)
+		return -EINVAL;
+	if (image->records[0].meta[1] != 1 ||
+	    image->records[image->count - 1].meta[1] != 4 ||
+	    !get_unaligned_le32(image->records[0].data) ||
+	    get_unaligned_le32(image->records[0].data) > 16 ||
+	    get_unaligned_le32(image->records[0].data + 4) != block)
+		return -EBADMSG;
+	native = image->records[3].meta[1] == 1;
+	if (native && (image->count <= APPLE_SFTL_ACCOUNT_RECORDS ||
+		       (image->count - APPLE_SFTL_ACCOUNT_RECORDS) % APPLE_SFTL_NATIVE_MAP_BATCH ||
+		       get_unaligned_le32(image->records[3].data + APPLE_SFTL_CHUNK - 4) !=
+			       APPLE_SFTL_SUBBLOCKS))
+		return -EBADMSG;
+	for (i = 0; i < image->count; i++) {
+		const u8 *meta = image->records[i].meta;
+		u32 group = meta[1] == 4 ? 7 : meta[1];
+
+		if (group < order || (native && !apple_sftl_native_context_tag(i, meta)))
+			return -EBADMSG;
+		order = group;
+		if (meta[0] != 0x1f || !meta[1] || meta[1] > 6 ||
+		    get_unaligned_le64(meta) >> 16 != image->first_sequence + i ||
+		    get_unaligned_le32(meta + 12) != U32_MAX)
+			return -EBADMSG;
+	}
+	copy = kzalloc(sizeof(*copy), GFP_NOIO);
+	if (!copy)
+		return -ENOMEM;
+	copy->records = kvzalloc(array_size(image->count, sizeof(*copy->records)), GFP_NOIO);
+	pages = kvmalloc(2 * sizeof(*pages), GFP_NOIO);
+	if (!copy->records || !pages) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	/* Check the whole block before the first program, including the space
+	 * past the new generation where a loader might find older records.
+	 */
+	for (i = 0; i < capacity; i += 4) {
+		ret = io->read(priv, start + i, &pages[0]);
+		if (ret)
+			goto out;
+		if (memchr_inv(&pages[0], 0xff, sizeof(*pages))) {
+			ret = -EBADMSG;
+			goto out;
+		}
+	}
+	for (i = 0; i < image->count; i += 4) {
+		for (j = 0; j < 4; j++) {
+			memcpy(pages[1].data + j * APPLE_SFTL_CHUNK,
+			       image->records[i + j].data, APPLE_SFTL_CHUNK);
+			memcpy(pages[1].oob + j * APPLE_SFTL_META,
+			       image->records[i + j].meta, APPLE_SFTL_META);
+		}
+		ret = sftl_gc_program(&pages[0], &pages[1], io, priv, start + i);
+		if (ret)
+			goto out;
+		for (j = 0; j < 4; j++) {
+			memcpy(copy->records[i + j].data,
+			       pages[0].data + j * APPLE_SFTL_CHUNK, APPLE_SFTL_CHUNK);
+			memcpy(copy->records[i + j].meta,
+			       pages[0].oob + j * APPLE_SFTL_META, APPLE_SFTL_META);
+		}
+	}
+	copy->count = image->count;
+	copy->first_sequence = get_unaligned_le64(copy->records[0].meta) >> 16;
+	copy->sequence = get_unaligned_le64(copy->records[copy->count - 1].meta) >> 16;
+	*readback = copy;
+	copy = NULL;
+out:
+	kvfree(pages);
+	apple_sftl_checkpoint_free(copy);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sftl_checkpoint_stage);
+
 /* No erase or map publication occurs here. Even an indeterminate program
  * consumes the transaction: the caller must recover before writing again.
  */
@@ -476,6 +602,7 @@ int apple_sftl_gc_relocate(struct apple_sftl_gc *gc,
 			u32 from = copy->source + offset, key = copy->logical + offset;
 			const u8 *meta;
 			u64 stamp;
+			u32 user_epoch;
 
 			if (cached != (from & ~3U)) {
 				cached = from & ~3U;
@@ -485,10 +612,11 @@ int apple_sftl_gc_relocate(struct apple_sftl_gc *gc,
 			}
 			meta = src->oob + (from & 3) * APPLE_SFTL_META;
 			stamp = get_unaligned_le64(meta) >> 16;
+			user_epoch = get_unaligned_le32(meta + 12);
 			/* Only rewrite ordinary unflagged data in its native class. */
 			if (meta[0] != 1 || meta[1] || !stamp ||
 			    get_unaligned_le32(meta + 8) != key ||
-			    get_unaligned_le32(meta + 12) != stamp >> 16 ||
+			    user_epoch > stamp >> 16 ||
 			    stamp > gc->victim_sequence) {
 				ret = -EBADMSG;
 				goto failed;
@@ -502,7 +630,7 @@ int apple_sftl_gc_relocate(struct apple_sftl_gc *gc,
 				sequence++;
 				put_unaligned_le64(sequence << 16 | 1, out);
 				put_unaligned_le32(key, out + 8);
-				put_unaligned_le32(sequence >> 16, out + 12);
+				put_unaligned_le32(user_epoch, out + 12);
 				if (++slot == 4) {
 					ret = sftl_gc_program(src, dst, io, priv, address);
 					if (ret)
@@ -527,6 +655,23 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_sftl_gc_relocate);
 
+int apple_sftl_gc_prepare_native(struct apple_sftl_gc *gc,
+		apple_sftl_prepare_accounting prepare, void *priv,
+		const u32 blocks[2], u32 capacity)
+{
+	int ret;
+
+	if (!gc || !prepare || !blocks || !capacity || gc->stage != APPLE_SFTL_GC_COPY ||
+	    gc->copied || gc->checkpoint)
+		return -EINVAL;
+	ret = prepare(priv, gc->snapshot.opaque, gc->snapshot.nr_opaque, &gc->snapshot,
+		      gc->victim, gc->destination, blocks);
+	if (ret)
+		return ret;
+	return apple_sftl_checkpoint_build(&gc->snapshot, blocks, 2,
+					   min(gc->max_records, capacity), &gc->checkpoint);
+}
+
 int apple_sftl_gc_checkpoint(struct apple_sftl_gc *gc, const u32 *blocks,
 			     u32 nr_blocks, struct apple_sftl_checkpoint **out)
 {
@@ -537,24 +682,39 @@ int apple_sftl_gc_checkpoint(struct apple_sftl_gc *gc, const u32 *blocks,
 	if (!out)
 		return -EINVAL;
 	*out = NULL;
-	if (!gc || gc->stage != APPLE_SFTL_GC_CHECKPOINT || gc->checkpoint)
+	if (!gc || gc->stage != APPLE_SFTL_GC_CHECKPOINT || gc->issued)
 		return -EINVAL;
 	if (!blocks || !nr_blocks || nr_blocks > 16)
 		return -EINVAL;
 	for (i = 0; i < nr_blocks; i++)
 		if (blocks[i] == gc->victim || blocks[i] == gc->destination)
 			return -EINVAL;
-	ret = apple_sftl_checkpoint_build(&gc->snapshot, blocks, nr_blocks,
-					  gc->max_records, &gc->checkpoint);
-	if (ret)
-		return ret;
-	ret = apple_sftl_checkpoint_build(&gc->snapshot, blocks, nr_blocks,
-					  gc->max_records, &image);
-	if (ret) {
-		apple_sftl_checkpoint_free(gc->checkpoint);
-		gc->checkpoint = NULL;
-		return ret;
+	if (!gc->checkpoint) {
+		ret = apple_sftl_checkpoint_build(&gc->snapshot, blocks, nr_blocks,
+						  gc->max_records, &gc->checkpoint);
+		if (ret)
+			return ret;
+	} else {
+		const u8 *base = gc->checkpoint->records[0].data;
+
+		if (get_unaligned_le32(base) != nr_blocks)
+			return -EINVAL;
+		for (i = 0; i < nr_blocks; i++)
+			if (get_unaligned_le32(base + 4 + 4 * i) != blocks[i])
+				return -EINVAL;
 	}
+	image = kmalloc(sizeof(*image), GFP_NOIO);
+	if (!image)
+		return -ENOMEM;
+	*image = *gc->checkpoint;
+	image->records = kvmalloc(array_size(image->count, sizeof(*image->records)), GFP_NOIO);
+	if (!image->records) {
+		kfree(image);
+		return -ENOMEM;
+	}
+	memcpy(image->records, gc->checkpoint->records,
+	       array_size(image->count, sizeof(*image->records)));
+	gc->issued = true;
 	*out = image;
 	return 0;
 }
@@ -565,7 +725,7 @@ int apple_sftl_gc_checkpoint_done(struct apple_sftl_gc *gc,
 {
 	const struct apple_sftl_checkpoint *expected;
 
-	if (!gc || gc->stage != APPLE_SFTL_GC_CHECKPOINT || !gc->checkpoint || !readback)
+	if (!gc || gc->stage != APPLE_SFTL_GC_CHECKPOINT || !gc->issued || !readback)
 		return -EINVAL;
 	expected = gc->checkpoint;
 	if (!readback->records || readback->count != expected->count ||
@@ -654,7 +814,7 @@ int apple_sftl_gc_recovered(struct apple_sftl_gc *gc,
 {
 	int ret;
 
-	if (!gc || gc->stage != APPLE_SFTL_GC_RECOVERY)
+	if (!gc || (gc->stage != APPLE_SFTL_GC_RECOVERY && gc->stage != APPLE_SFTL_GC_VERIFIED))
 		return -EINVAL;
 	ret = sftl_check_map(recovered);
 	if (ret)

@@ -322,7 +322,7 @@ static void reclaim_gc_boundaries(struct kunit *test)
 
 enum copy_fault {
 	COPY_GOOD, COPY_BAD_KEY, COPY_FLAGGED, COPY_KIND2, COPY_ZERO_STAMP,
-	COPY_BUSY, COPY_PROGRAM_ERROR,
+	COPY_FUTURE_USER_EPOCH, COPY_BUSY, COPY_PROGRAM_ERROR,
 	COPY_DATA_MISMATCH, COPY_OOB_MISMATCH,
 };
 
@@ -341,13 +341,14 @@ static int copy_read(void *priv, u32 addr, struct apple_sftl_gc_page *page)
 		for (i = 0; i < 4; i++) {
 			u8 *meta = page->oob + i * APPLE_SFTL_META;
 			u32 chunk = addr % APPLE_SFTL_STRIDE + i;
+			u64 weave = m->fault == COPY_ZERO_STAMP ? 0 : 0x10050ULL + chunk;
 
 			memset(page->data + i * APPLE_SFTL_CHUNK, chunk, APPLE_SFTL_CHUNK);
-			put_unaligned_le64((m->fault == COPY_ZERO_STAMP ? 0ULL : 80ULL + chunk) << 16, meta);
+			put_unaligned_le64(weave << 16, meta);
 			meta[0] = m->fault == COPY_KIND2 ? 2 : 1;
 			meta[1] = m->fault == COPY_FLAGGED;
 			put_unaligned_le32(m->fault == COPY_BAD_KEY ? 99 : chunk - 1, meta + 8);
-			put_unaligned_le32(0, meta + 12);
+			put_unaligned_le32(m->fault == COPY_FUTURE_USER_EPOCH ? 2 : 0, meta + 12);
 		}
 		return 0;
 	}
@@ -395,6 +396,9 @@ static void reclaim_copy_live_pages(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, opaque);
 	KUNIT_ASSERT_NOT_NULL(test, m);
 	reclaim_source(&snapshot, opaque, runs, 4);
+	/* Copy historical data across a second weave epoch, including head padding. */
+	snapshot.sequence = snapshot.journal_sequence = 0x1fffd;
+	victim.last_sequence = 0x100c7;
 	runs[0] = (struct apple_sftl_extent) { 0, 3, 4 * APPLE_SFTL_STRIDE + 1 };
 	runs[1] = (struct apple_sftl_extent) { 3, 1, 6 * APPLE_SFTL_STRIDE };
 	runs[2] = (struct apple_sftl_extent) { 4, 2, 4 * APPLE_SFTL_STRIDE + 5 };
@@ -429,13 +433,14 @@ static void reclaim_copy_live_pages(struct kunit *test)
 			const u8 *meta = &m->pages[i / 4].oob[(i % 4) * APPLE_SFTL_META];
 			const u8 *data = &m->pages[i / 4].data[(i % 4) * APPLE_SFTL_CHUNK];
 
-			KUNIT_EXPECT_EQ(test, get_unaligned_le64(meta) >> 16, 201ULL + i);
+			KUNIT_EXPECT_EQ(test, get_unaligned_le64(meta) >> 16, 0x1fffeULL + i);
 			KUNIT_EXPECT_EQ(test, get_unaligned_le32(meta + 8), keys[i]);
+			KUNIT_EXPECT_EQ(test, get_unaligned_le32(meta + 12), 0U);
 			KUNIT_EXPECT_EQ(test, data[0], (u8)(keys[i] + 1));
 			KUNIT_EXPECT_EQ(test, data[APPLE_SFTL_CHUNK - 1], data[0]);
 		}
 		KUNIT_ASSERT_EQ(test, apple_sftl_gc_checkpoint(gc, &context_block, 1, &image), 0);
-		KUNIT_EXPECT_EQ(test, image->first_sequence, 209ULL);
+		KUNIT_EXPECT_EQ(test, image->first_sequence, 0x20006ULL);
 		KUNIT_ASSERT_EQ(test, apple_sftl_gc_checkpoint_done(gc, image), 0);
 		memcpy(relocated, runs, sizeof(runs));
 		relocated[0].provider = dest + 3;
