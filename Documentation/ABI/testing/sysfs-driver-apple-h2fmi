@@ -1,0 +1,18 @@
+What:		/sys/bus/platform/drivers/apple-h2fmi/<device>/flash_trace_sequence
+Date:		November 2026
+Contact:	linux-mtd@lists.infradead.org
+Description:
+		Read-only boundary for the apple_h2fmi_transaction trace event.
+		The two decimal numbers are the probe generation and the latest
+		event sequence allocated by that driver instance. Generation one
+		identifies the first probe of the built-in driver. A second probe
+		cannot establish coverage from the start of the boot.
+
+		Sequence numbers start at one. They advance for request entry,
+		writes to the NAND command register, status polls, and request
+		returns. A gap in a capture indicates a lost or filtered event.
+		A snapshot can cut through an active request. Read the boundary
+		with the workload quiescent to check complete requests.
+
+		The attribute returns ENODATA if the tracepoint was disabled when
+		the driver probed. Reading the attribute does not access flash.

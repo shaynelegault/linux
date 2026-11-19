@@ -44,6 +44,9 @@
 
 #include "mtd-apple-h2fmi.h"
 
+#define CREATE_TRACE_POINTS
+#include <trace/events/apple_h2fmi.h>
+
 #define H2FMI_BUSES		2
 #define H2FMI_PAGE_MASK		(H2FMI_PAGE_DATA - 1)
 
@@ -97,6 +100,10 @@ struct h2fmi_bus {
 	u8 *page;		/* one raw page; only touched under lock */
 	struct h2fmi_geometry geometry;
 	bool failed;		/* block further I/O in this driver instance */
+	u64 trace_request;	/* protected by the bus lock */
+	u32 trace_row;
+	u16 trace_operation;
+	u16 trace_command;
 };
 
 struct h2fmi_die {
@@ -118,7 +125,63 @@ struct h2fmi {
 	struct platform_device *sftl;
 	struct apple_ppn_ops ppn_ops;
 	struct apple_ppn_access access;
+	atomic64_t trace_sequence;
+	unsigned int probe_generation;
+	bool trace_from_probe;
 };
+
+enum h2fmi_trace_kind { H2FMI_BEGIN, H2FMI_COMMAND, H2FMI_REPLY, H2FMI_END };
+
+static atomic_t h2fmi_probe_generation = ATOMIC_INIT(0);
+
+static void h2fmi_record(struct h2fmi *fmi, struct h2fmi_bus *b,
+			 enum h2fmi_trace_kind kind, u16 opcode, int value)
+{
+	u64 seq;
+
+	if (!fmi->trace_from_probe)
+		return;
+	seq = atomic64_inc_return(&fmi->trace_sequence);
+	if (kind == H2FMI_BEGIN)
+		b->trace_request = seq;
+	trace_apple_h2fmi_transaction(dev_name(fmi->dev), seq, b->trace_request,
+				      b - fmi->bus, kind, opcode, b->trace_row, value);
+}
+
+static void h2fmi_record_start(struct h2fmi *fmi, struct h2fmi_bus *b,
+			       u16 operation, u32 row)
+{
+	if (fmi->trace_from_probe) {
+		b->trace_row = row;
+		b->trace_operation = operation;
+		h2fmi_record(fmi, b, H2FMI_BEGIN, operation, 0);
+	}
+}
+
+static int h2fmi_record_end(struct h2fmi *fmi, struct h2fmi_bus *b, int ret)
+{
+	h2fmi_record(fmi, b, H2FMI_END, b->trace_operation, ret);
+	return ret;
+}
+
+/* A host uses the final sequence to detect a missing suffix in tracefs. */
+static ssize_t flash_trace_sequence_show(struct device *dev,
+					 struct device_attribute *attr, char *buf)
+{
+	struct h2fmi *fmi = dev_get_drvdata(dev);
+
+	if (!fmi->trace_from_probe)
+		return -ENODATA;
+	return sysfs_emit(buf, "%u %lld\n", fmi->probe_generation,
+			  atomic64_read(&fmi->trace_sequence));
+}
+static DEVICE_ATTR_RO(flash_trace_sequence);
+
+static struct attribute *h2fmi_attrs[] = {
+	&dev_attr_flash_trace_sequence.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(h2fmi);
 
 /*
  * h2fmi_wait_done: poll until (reg & mask) == want, then write want back --
@@ -151,6 +214,10 @@ static int h2fmi_cmd_write(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op, u8 op2
 	for (i = 0; i < ARRAY_SIZE(h2fmi_ops); i++)
 		if (h2fmi_ops[i][0] == op && h2fmi_ops[i][1] == op2) {
 			writel(op | op2 << 8, b->fmc + FMC_CMD);
+			if (fmi->trace_from_probe) {
+				b->trace_command = op | op2 << 8;
+				h2fmi_record(fmi, b, H2FMI_COMMAND, b->trace_command, 0);
+			}
 			return 0;
 		}
 
@@ -214,6 +281,7 @@ static int h2fmi_poll_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
 
 	ret = readl_poll_timeout(b->fmc + FMC_STATUS, v, v & 0x20, 0, 2000000);
 	if (ret) {
+		h2fmi_record(fmi, b, H2FMI_REPLY, b->trace_command, ret);
 		dev_err(fmi->dev, "status timeout: FMC+0x44 0x%08x FMI+0xc 0x%08x byte 0x%02x\n",
 			v, readl(b->fmi + FMI_STATUS),
 			(u8)readl(b->fmc + FMC_NAND_STATUS));
@@ -223,6 +291,7 @@ static int h2fmi_poll_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
 	}
 
 	*st = readl(b->fmc + FMC_NAND_STATUS);
+	h2fmi_record(fmi, b, H2FMI_REPLY, b->trace_command, *st);
 	writel(0, b->fmc + FMC_RW_CTRL);
 	h2fmi_clear_irqs(b);
 	return 0;
@@ -307,13 +376,14 @@ static int h2fmi_read_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 	u32 on, if_ctrl;
 	int ret, end_ret;
 
+	h2fmi_record_start(fmi, b, op | op2 << 8, address);
 	*status = 0;
 	if (b->failed)
-		return -EIO;
+		return h2fmi_record_end(fmi, b, -EIO);
 	on = readl(b->fmc + FMC_ON);
 	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
 	if (on != 5)
-		return -EIO;
+		return h2fmi_record_end(fmi, b, -EIO);
 
 	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
 	h2fmi_clear_irqs(b);
@@ -335,9 +405,9 @@ static int h2fmi_read_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 	h2fmi_device_reset(b, on, if_ctrl);
 	if (ret || end_ret) {
 		b->failed = true;
-		return ret ? ret : end_ret;
+		return h2fmi_record_end(fmi, b, ret ? ret : end_ret);
 	}
-	return 0;
+	return h2fmi_record_end(fmi, b, 0);
 }
 
 static int h2fmi_read_geometry(struct h2fmi *fmi, struct h2fmi_bus *b)
@@ -445,12 +515,13 @@ static int h2fmi_program_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 	u8 status = 0;
 	int ret;
 
+	h2fmi_record_start(fmi, b, 0x8a, row);
 	if (b->failed)
-		return -EIO;
+		return h2fmi_record_end(fmi, b, -EIO);
 	on = readl(b->fmc + FMC_ON);
 	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
 	if (on != 5)
-		return -EIO;
+		return h2fmi_record_end(fmi, b, -EIO);
 	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
 	h2fmi_clear_irqs(b);
 	ret = h2fmi_write_address(fmi, b, row);
@@ -472,7 +543,7 @@ static int h2fmi_program_transaction(struct h2fmi *fmi, struct h2fmi_bus *b,
 		dev_err(fmi->dev, "PPN program row %08x: status %02x, error %d\n",
 			row, status, ret);
 	}
-	return ret;
+	return h2fmi_record_end(fmi, b, ret);
 }
 
 static void h2fmi_join_page(u8 *raw, const u8 *data, const u8 *oob)
@@ -670,12 +741,13 @@ static int h2fmi_erase_transaction(struct h2fmi *fmi, struct h2fmi_bus *b, u32 r
 	u8 queued = 0, completed = 0;
 	int ret;
 
+	h2fmi_record_start(fmi, b, 0xd76a, row);
 	if (b->failed)
-		return -EIO;
+		return h2fmi_record_end(fmi, b, -EIO);
 	on = readl(b->fmc + FMC_ON);
 	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
 	if (on != 5)
-		return -EIO;
+		return h2fmi_record_end(fmi, b, -EIO);
 
 	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
 	h2fmi_clear_irqs(b);
@@ -693,7 +765,7 @@ static int h2fmi_erase_transaction(struct h2fmi *fmi, struct h2fmi_bus *b, u32 r
 			row, queued, completed);
 		ret = -EIO;
 	}
-	return ret;
+	return h2fmi_record_end(fmi, b, ret);
 }
 
 static int h2fmi_ppn_erase(void *priv, unsigned int bus, unsigned int cau,
@@ -953,6 +1025,9 @@ static int h2fmi_probe(struct platform_device *pdev)
 	if (!fmi)
 		return -ENOMEM;
 	fmi->dev = &pdev->dev;
+	fmi->probe_generation = atomic_inc_return(&h2fmi_probe_generation);
+	fmi->trace_from_probe = trace_apple_h2fmi_transaction_enabled();
+	atomic64_set(&fmi->trace_sequence, 0);
 	apple_ppn_access_init(&fmi->access);
 
 	/* Six regions, in the ADT's order: FMI, FMC, ECC for bus 0, then bus 1. */
@@ -1048,6 +1123,7 @@ static struct platform_driver h2fmi_driver = {
 	.remove = h2fmi_remove,
 	.driver = {
 		.name = "apple-h2fmi",
+		.dev_groups = h2fmi_groups,
 		.of_match_table = h2fmi_of_match,
 	},
 };
