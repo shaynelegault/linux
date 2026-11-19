@@ -41,6 +41,7 @@
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 
 #include "mtd-apple-h2fmi.h"
 
@@ -126,11 +127,14 @@ struct h2fmi {
 	struct apple_ppn_ops ppn_ops;
 	struct apple_ppn_access access;
 	atomic64_t trace_sequence;
+	spinlock_t trace_io_lock;
 	unsigned int probe_generation;
 	bool trace_from_probe;
 };
 
-enum h2fmi_trace_kind { H2FMI_BEGIN, H2FMI_COMMAND, H2FMI_REPLY, H2FMI_END };
+enum h2fmi_trace_kind {
+	H2FMI_BEGIN, H2FMI_COMMAND, H2FMI_REPLY, H2FMI_END, H2FMI_LAUNCH,
+};
 
 static atomic_t h2fmi_probe_generation = ATOMIC_INIT(0);
 
@@ -162,6 +166,44 @@ static int h2fmi_record_end(struct h2fmi *fmi, struct h2fmi_bus *b, int ret)
 {
 	h2fmi_record(fmi, b, H2FMI_END, b->trace_operation, ret);
 	return ret;
+}
+
+/* Loading FMC_CMD stages an opcode. Writing FMC_RW_CTRL starts the I/O. */
+static void h2fmi_launch(struct h2fmi *fmi, struct h2fmi_bus *b, u32 control)
+{
+	unsigned long flags;
+
+	if (!fmi->trace_from_probe) {
+		writel(control, b->fmc + FMC_RW_CTRL);
+		return;
+	}
+	spin_lock_irqsave(&fmi->trace_io_lock, flags);
+	writel(control, b->fmc + FMC_RW_CTRL);
+	/* Flush this FMC's posted write before the other bus can record a launch. */
+	readl(b->fmc + FMC_ON);
+	h2fmi_record(fmi, b, H2FMI_LAUNCH, b->trace_command, control);
+	spin_unlock_irqrestore(&fmi->trace_io_lock, flags);
+}
+
+/*
+ * Keep the poll outside the lock. Order its returned byte with launches
+ * on both FMCs, keeping a timeout distinct from a NAND status.
+ */
+static void h2fmi_read_reply(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st,
+			     int error)
+{
+	unsigned long flags;
+
+	if (!fmi->trace_from_probe) {
+		if (!error)
+			*st = readl(b->fmc + FMC_NAND_STATUS);
+		return;
+	}
+	spin_lock_irqsave(&fmi->trace_io_lock, flags);
+	if (!error)
+		*st = readl(b->fmc + FMC_NAND_STATUS);
+	h2fmi_record(fmi, b, H2FMI_REPLY, b->trace_command, error ? error : *st);
+	spin_unlock_irqrestore(&fmi->trace_io_lock, flags);
 }
 
 /* A host uses the final sequence to detect a missing suffix in tracefs. */
@@ -240,7 +282,7 @@ static int h2fmi_cmd1(struct h2fmi *fmi, struct h2fmi_bus *b, u8 op)
 
 	if (ret)
 		return ret;
-	writel(1, b->fmc + FMC_RW_CTRL);
+	h2fmi_launch(fmi, b, 1);
 	return h2fmi_wait(fmi, b->fmc, FMC_STATUS, 1, 1);
 }
 
@@ -257,7 +299,7 @@ static int h2fmi_cmd_addr_cmd(struct h2fmi *fmi, struct h2fmi_bus *b,
 		return ret;
 	writel(addr, b->fmc + FMC_ADDR0);
 	writel((naddr + 7) & 7, b->fmc + FMC_ADDRNUM);
-	writel(0xb, b->fmc + FMC_RW_CTRL);
+	h2fmi_launch(fmi, b, 0xb);
 	return h2fmi_wait(fmi, b->fmc, FMC_STATUS, 0xb, 0xb);
 }
 
@@ -277,11 +319,11 @@ static int h2fmi_poll_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
 	writel(0x4040, b->fmc + FMC_STATUS_MASK);
 	writel(0, b->fmc + FMC_DATANUM);
 	writel(0x20, b->fmc + FMC_INTMASK);
-	writel(0x50, b->fmc + FMC_RW_CTRL);
+	h2fmi_launch(fmi, b, 0x50);
 
 	ret = readl_poll_timeout(b->fmc + FMC_STATUS, v, v & 0x20, 0, 2000000);
+	h2fmi_read_reply(fmi, b, st, ret);
 	if (ret) {
-		h2fmi_record(fmi, b, H2FMI_REPLY, b->trace_command, ret);
 		dev_err(fmi->dev, "status timeout: FMC+0x44 0x%08x FMI+0xc 0x%08x byte 0x%02x\n",
 			v, readl(b->fmi + FMI_STATUS),
 			(u8)readl(b->fmc + FMC_NAND_STATUS));
@@ -290,8 +332,6 @@ static int h2fmi_poll_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
 		return ret;
 	}
 
-	*st = readl(b->fmc + FMC_NAND_STATUS);
-	h2fmi_record(fmi, b, H2FMI_REPLY, b->trace_command, *st);
 	writel(0, b->fmc + FMC_RW_CTRL);
 	h2fmi_clear_irqs(b);
 	return 0;
@@ -303,7 +343,7 @@ static int h2fmi_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *st)
 
 	if (ret)
 		return ret;
-	writel(3, b->fmc + FMC_RW_CTRL);
+	h2fmi_launch(fmi, b, 3);
 	ret = h2fmi_wait(fmi, b->fmc, FMC_STATUS, 3, 3);
 	if (ret)
 		return ret;
@@ -460,7 +500,7 @@ static int h2fmi_write_address(struct h2fmi *fmi, struct h2fmi_bus *b,
 		return ret;
 	writel(row, b->fmc + FMC_ADDR0);
 	writel(3, b->fmc + FMC_ADDRNUM);
-	writel(9, b->fmc + FMC_RW_CTRL);
+	h2fmi_launch(fmi, b, 9);
 	return h2fmi_wait(fmi, b->fmc, FMC_STATUS, 9, 9);
 }
 
@@ -1028,6 +1068,7 @@ static int h2fmi_probe(struct platform_device *pdev)
 	fmi->probe_generation = atomic_inc_return(&h2fmi_probe_generation);
 	fmi->trace_from_probe = trace_apple_h2fmi_transaction_enabled();
 	atomic64_set(&fmi->trace_sequence, 0);
+	spin_lock_init(&fmi->trace_io_lock);
 	apple_ppn_access_init(&fmi->access);
 
 	/* Six regions, in the ADT's order: FMI, FMC, ECC for bus 0, then bus 1. */

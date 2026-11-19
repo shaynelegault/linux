@@ -8,9 +8,15 @@ Description:
 		identifies the first probe of the built-in driver. A second probe
 		cannot establish coverage from the start of the boot.
 
-		Sequence numbers start at one. They advance for request entry,
-		writes to the NAND command register, status polls, and request
-		returns. A gap in a capture indicates a lost or filtered event.
+		Sequence numbers start at one. Events cover request entry,
+		staged opcodes, I/O launches, status replies and request returns.
+		Kind 4 gives the nonzero FMC_RW_CTRL value that starts the I/O.
+		The diagnostic driver reads the FMC_ON register to drain the
+		posted write before another launch or status byte can be
+		recorded on either bus. The two requests can otherwise overlap.
+		Kind 1 identifies when the opcode was staged. Older captures
+		contain only those opcode events at the start of a command.
+		A gap in a capture indicates a lost or filtered event.
 		A snapshot can cut through an active request. Read the boundary
 		with the workload quiescent to check complete requests.
 

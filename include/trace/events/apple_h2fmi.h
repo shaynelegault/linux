@@ -7,7 +7,7 @@
 
 #include <linux/tracepoint.h>
 
-/* kind: 0 request, 1 command-register write, 2 status poll, 3 return. */
+/* kind: 0 request, 1 staged opcode, 2 status reply, 3 return, 4 I/O launch. */
 TRACE_EVENT(apple_h2fmi_transaction,
 	TP_PROTO(const char *device, u64 seq, u64 request, u8 bus, u8 kind,
 		 u16 opcode, u32 row, int value),
