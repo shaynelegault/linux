@@ -6,6 +6,7 @@
 #include <linux/idr.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/mtd/apple-ppn-access.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/sched/mm.h>
@@ -188,6 +189,16 @@ static int sftl_disk_probe(struct platform_device *pdev)
 
 	if (!provider || !provider->ops || !provider->ops->read_page)
 		return -EINVAL;
+	/* A read-only disk also needs its recovered map to stay current. */
+	if (provider->access) {
+		ret = apple_ppn_claim_sftl(provider->access);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(&pdev->dev, apple_ppn_release_sftl,
+					       provider->access);
+		if (ret)
+			return ret;
+	}
 	sftl = kzalloc(sizeof(*sftl), GFP_KERNEL);
 	if (!sftl)
 		return -ENOMEM;

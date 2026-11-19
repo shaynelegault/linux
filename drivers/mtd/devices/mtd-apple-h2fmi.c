@@ -34,6 +34,7 @@
 #include <linux/math64.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/mtd/apple-ppn-access.h>
 #include <linux/mtd/apple-ppn.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mutex.h>
@@ -116,6 +117,7 @@ struct h2fmi {
 	unsigned int ndies;
 	struct platform_device *sftl;
 	struct apple_ppn_ops ppn_ops;
+	struct apple_ppn_access access;
 };
 
 /*
@@ -557,8 +559,12 @@ static int h2fmi_mtd_write_oob(struct mtd_info *mtd, loff_t to,
 	    ops->ooblen != H2FMI_PAGE_OOB || ops->ooboffs ||
 	    !ops->datbuf || !ops->oobbuf)
 		return -EINVAL;
+	ret = apple_ppn_begin_raw_write(&fmi->access);
+	if (ret)
+		return ret;
 	ret = h2fmi_program_page(fmi, b, die->cau, block, pg,
 				 ops->datbuf, ops->oobbuf);
+	apple_ppn_end_raw_write(&fmi->access);
 	if (!ret) {
 		ops->retlen = H2FMI_PAGE_DATA;
 		ops->oobretlen = H2FMI_PAGE_OOB;
@@ -732,6 +738,7 @@ static int h2fmi_register_sftl(struct h2fmi *fmi)
 		.dev = fmi->dev,
 		.ops = &fmi->ppn_ops,
 		.priv = fmi,
+		.access = &fmi->access,
 		.buses = H2FMI_BUSES,
 		.caus = g->caus,
 		.blocks = g->blocks,
@@ -946,6 +953,7 @@ static int h2fmi_probe(struct platform_device *pdev)
 	if (!fmi)
 		return -ENOMEM;
 	fmi->dev = &pdev->dev;
+	apple_ppn_access_init(&fmi->access);
 
 	/* Six regions, in the ADT's order: FMI, FMC, ECC for bus 0, then bus 1. */
 	for (i = 0; i < H2FMI_BUSES; i++) {

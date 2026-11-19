@@ -5,6 +5,7 @@
 #include <linux/types.h>
 
 struct device;
+struct apple_ppn_access;
 
 #define APPLE_PPN_PAGE_SIZE 16384
 #define APPLE_PPN_OOB_SIZE 64
@@ -35,6 +36,8 @@ struct apple_ppn {
 	u16 caus;
 	u16 blocks;
 	u16 pages;
+	/* Shared by all raw writers on media also exposed through SFTL. */
+	struct apple_ppn_access *access;
 };
 
 #endif

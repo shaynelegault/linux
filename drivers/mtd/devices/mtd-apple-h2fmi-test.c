@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/mtd/apple-ppn-access.h>
 
 #include "mtd-apple-h2fmi.h"
 
@@ -207,7 +208,37 @@ static void h2fmi_program_status_test(struct kunit *test)
 	}
 }
 
+static void h2fmi_raw_write_ownership_test(struct kunit *test)
+{
+	struct apple_ppn_access access;
+	bool writer;
+	int ret;
+
+	apple_ppn_access_init(&access);
+	KUNIT_ASSERT_EQ(test, apple_ppn_begin_raw_write(&access), 0);
+	/* An SFTL claim cannot pass the write lock until raw readback ends. */
+	writer = down_write_trylock(&access.lock);
+	if (writer)
+		up_write(&access.lock);
+	KUNIT_EXPECT_FALSE(test, writer);
+	apple_ppn_end_raw_write(&access);
+
+	KUNIT_ASSERT_EQ(test, apple_ppn_claim_sftl(&access), 0);
+	KUNIT_EXPECT_EQ(test, apple_ppn_claim_sftl(&access), -EBUSY);
+	ret = apple_ppn_begin_raw_write(&access);
+	if (!ret)
+		apple_ppn_end_raw_write(&access);
+	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
+	apple_ppn_release_sftl(&access);
+
+	KUNIT_ASSERT_EQ(test, apple_ppn_begin_raw_write(&access), 0);
+	apple_ppn_end_raw_write(&access);
+	KUNIT_ASSERT_EQ(test, apple_ppn_claim_sftl(&access), 0);
+	apple_ppn_release_sftl(&access);
+}
+
 static struct kunit_case h2fmi_test_cases[] = {
+	KUNIT_CASE(h2fmi_raw_write_ownership_test),
 	KUNIT_CASE(h2fmi_geometry_test),
 	KUNIT_CASE(h2fmi_invalid_geometry_test),
 	KUNIT_CASE(h2fmi_row_test),
