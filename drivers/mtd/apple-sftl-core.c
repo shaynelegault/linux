@@ -43,6 +43,7 @@ enum sftl_block_role {
 	SFTL_CLEAN_FREE = 1,
 	SFTL_CLOSED_DATA = 3,
 	SFTL_OPEN_DATA = 4,
+	SFTL_CONTEXT = 7,
 	SFTL_DIRTY_FREE = 9,
 };
 
@@ -72,6 +73,7 @@ struct apple_sftl {
 	struct apple_sftl_vfl_source vfl_source;
 	bool vfl_degraded, context_degraded, native_context;
 	u8 roles[SFTL_SUBBLOCKS], block_flags[SFTL_SUBBLOCKS];
+	u16 wear[SFTL_SUBBLOCKS];
 	struct rb_root runs;
 	struct sftl_records context;
 	struct apple_sftl_user_seq *closed_user_seq;
@@ -849,8 +851,8 @@ static int sftl_load_ranges(struct apple_sftl *sftl, const u8 *payload, u32 *cur
  * can also describe an unnamed context spare, a reserved block or a stream.
  * An older saved role can veto a new allocation while that fallback exists.
  */
-static void sftl_load_block_roles(struct apple_sftl *sftl, const u8 *meta, const u8 *payload,
-				  bool selected)
+static int sftl_load_block_roles(struct apple_sftl *sftl, const u8 *meta, const u8 *payload,
+				 bool selected)
 {
 	u32 block = get_unaligned_le16(meta + 8), count = get_unaligned_le16(meta + 10);
 
@@ -859,16 +861,20 @@ static void sftl_load_block_roles(struct apple_sftl *sftl, const u8 *meta, const
 		u16 live = get_unaligned_le16(payload + 2);
 
 		if (selected) {
+			if (role == SFTL_CONTEXT && live)
+				return -EBADMSG;
 			if ((role == SFTL_CLEAN_FREE || role == SFTL_DIRTY_FREE) && live)
 				role = 0;
 			sftl->roles[block] = role;
 			sftl->block_flags[block] = payload[1];
+			sftl->wear[block] = get_unaligned_le16(payload + 6);
 		} else if (role != SFTL_CLEAN_FREE || live) {
 			__set_bit(block, sftl->fallback_occupied);
 		}
 		block++;
 		payload += 8;
 	}
+	return 0;
 }
 
 /* -ENODATA distinguishes a valid prefix from malformed records or a read error. */
@@ -877,7 +883,7 @@ static int sftl_decode_generation(struct apple_sftl *sftl, const struct sftl_rec
 {
 	u32 cursor = 0, map_records = 0, i, previous_order = 0;
 	u64 first_sequence = records->items[first].stamp & SFTL_SEQUENCE;
-	bool base_tags = true, native = false, short_range = false;
+	bool base_tags = true, at_base = false, native = false, short_range = false;
 
 	for (i = first; i < end; i++) {
 		const struct sftl_record *record = &records->items[i];
@@ -902,6 +908,8 @@ static int sftl_decode_generation(struct apple_sftl *sftl, const struct sftl_rec
 
 			if (subtype != 1 || !names || names > SFTL_MAX_CONTEXTS)
 				return -EBADMSG;
+			at_base = !(record->address % SFTL_STRIDE) &&
+				  get_unaligned_le32(payload + 4) == record->address / SFTL_STRIDE;
 			for (k = 0; k < names; k++) {
 				u32 block = get_unaligned_le32(payload + 4 + k * 4);
 
@@ -916,7 +924,7 @@ static int sftl_decode_generation(struct apple_sftl *sftl, const struct sftl_rec
 		if (index < 4 && subtype == 1) {
 			base_tags &= apple_sftl_native_context_tag(index, meta);
 			if (index == 3) {
-				if (!base_tags ||
+				if (!at_base || !base_tags ||
 				    get_unaligned_le32(payload + SFTL_CHUNK - 4) != SFTL_SUBBLOCKS)
 					return -EBADMSG;
 				native = true;
@@ -924,8 +932,11 @@ static int sftl_decode_generation(struct apple_sftl *sftl, const struct sftl_rec
 		}
 		if (native && !apple_sftl_native_context_tag(index, meta))
 			return -EBADMSG;
-		if (native && subtype == 3)
-			sftl_load_block_roles(sftl, meta, payload, true);
+		if (native && subtype == 3) {
+			ret = sftl_load_block_roles(sftl, meta, payload, true);
+			if (ret)
+				return ret;
+		}
 		if (subtype == 4) {
 			ret = sftl_load_ranges(sftl, payload, &cursor, &short_range);
 			if (ret)
@@ -951,6 +962,64 @@ static int sftl_decode_generation(struct apple_sftl *sftl, const struct sftl_rec
 	sftl->native_context = native;
 	return 0;
 }
+
+/* Losing the first lane while retiring an old context also loses its base
+ * header. The selected checkpoint can still identify the physical block as
+ * reserved. Accept only older native records at their original page offsets,
+ * with whole-lane erasure or an erased tail on each surviving lane.
+ */
+static int sftl_check_context_remnant(struct apple_sftl *sftl, u32 block, u64 selected)
+{
+	u32 streams = hweight16(sftl->lanes[block]), pos, j;
+	u16 ended = 0;
+	u64 base = 0;
+
+	if (!streams)
+		return -EBADMSG;
+	for (pos = 0; pos < streams * 128; pos++) {
+		u16 lane = BIT(pos % streams);
+		unsigned int chunk;
+		int ret = sftl_read_address(sftl, block * SFTL_STRIDE + pos * 4, &chunk);
+
+		if (ret) {
+			if (ret == -EBADMSG)
+				return ret;
+			/* This site's unread contents cannot establish a writable
+			 * medium. The complete checkpoint still serves reads.
+			 */
+			sftl->context_degraded = true;
+			return 0;
+		}
+		if (sftl_erased(sftl->oob, sizeof(sftl->oob))) {
+			if (!sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE))
+				return -EBADMSG;
+			ended |= lane;
+			continue;
+		}
+		if (ended & lane)
+			return -EBADMSG;
+		if (!pos && (!get_unaligned_le32(sftl->page) ||
+		    get_unaligned_le32(sftl->page) > SFTL_MAX_CONTEXTS ||
+		    get_unaligned_le32(sftl->page + 4) != block ||
+		    get_unaligned_le32(sftl->page + APPLE_PPN_PAGE_SIZE - 4) != SFTL_SUBBLOCKS))
+			return -EBADMSG;
+		for (j = 0; j < 4; j++) {
+			const u8 *meta = sftl->oob + SFTL_META * j;
+			u32 offset = 4 * pos + j;
+			u64 sequence = sftl_sequence(meta);
+
+			if (!apple_sftl_native_context_tag(offset, meta) || sequence <= offset ||
+			    sequence >= selected || (base && sequence - offset != base))
+				return -EBADMSG;
+			base = sequence - offset;
+		}
+	}
+	if (base)
+		sftl->context_degraded = true;
+	return 0;
+}
+
+static void sftl_mark_mapped(struct apple_sftl *sftl, unsigned long *blocks);
 
 static int sftl_context(struct apple_sftl *sftl, const u8 *heads, struct sftl_records *journal)
 {
@@ -1072,14 +1141,41 @@ static int sftl_context(struct apple_sftl *sftl, const u8 *heads, struct sftl_re
 		ret = -EBADMSG;
 		goto out;
 	}
-	/* Retired lanes may be wholly erased while old lanes still hold
-	 * verified context records. Require a newer intact generation which
-	 * names that site, and keep the writer off until reconciliation.
+	sftl_mark_mapped(sftl, sftl->checkpoint_used);
+	/* A native base names this save's capacity, not the previous
+	 * generation. The old base may have disappeared with its first lane.
 	 */
+	if (sftl->native_context) {
+		u32 checked = 0;
+		u64 selected = records.items[first].stamp & SFTL_SEQUENCE;
+
+		for (block = 0; block < SFTL_SUBBLOCKS; block++) {
+			if (sftl->roles[block] != SFTL_CONTEXT)
+				continue;
+			if (test_bit(block, sftl->checkpoint_used) || test_bit(block, sftl->vfl_reserved)) {
+				ret = -EBADMSG;
+				goto out;
+			}
+			if (test_bit(block, sftl->unknown_lane_flags))
+				sftl->context_degraded = true;
+			if (test_bit(block, sftl->reserved) && !test_bit(block, gapped))
+				continue;
+			__set_bit(block, sftl->reserved);
+			/* Bound additional full-block checks on unfamiliar media. */
+			if (++checked > SFTL_MAX_CONTEXTS) {
+				sftl->context_degraded = true;
+				continue;
+			}
+			ret = sftl_check_context_remnant(sftl, block, selected);
+			if (ret)
+				goto out;
+		}
+	}
 	for (i = 0; i < records.count; i++) {
 		block = records.items[i].address / SFTL_STRIDE;
 		if (test_bit(block, gapped)) {
-			if (i >= first || !test_bit(block, named)) {
+			if (i >= first || (sftl->native_context ?
+			    sftl->roles[block] != SFTL_CONTEXT : !test_bit(block, named))) {
 				ret = -EBADMSG;
 				goto out;
 			}
@@ -1534,7 +1630,6 @@ int apple_sftl_load(struct apple_ppn *provider, struct apple_sftl **out)
 	if (ret)
 		goto failed;
 	/* A map entry superseded by journal replay still belongs to the saved map. */
-	sftl_mark_mapped(sftl, sftl->checkpoint_used);
 	ret = sftl_journal(sftl, heads, &journal);
 	if (ret)
 		goto failed;
@@ -1804,7 +1899,9 @@ static int sftl_reclaim_retired(struct apple_sftl *sftl, u32 *claimed,
 	u32 block;
 	int ret = -ENOSPC;
 
-	if (!sftl->ppn->ops->erase_block)
+	if (!sftl->ppn->ops->erase_block ||
+	    (sftl->native_context &&
+	     (!sftl->checkpoint_ops || !sftl->checkpoint_ops->account_retired)))
 		return -ENOSPC;
 	/* The top 32 physical blocks can contain native bootstrap members. */
 	for (block = 1; block < SFTL_BLOCKS - 32; block++) {
@@ -1813,6 +1910,8 @@ static int sftl_reclaim_retired(struct apple_sftl *sftl, u32 *claimed,
 		};
 
 		if (test_bit(block, sftl->used) || !sftl_retired_candidate(sftl, block))
+			continue;
+		if (sftl->native_context && sftl->wear[block] == 0xffff)
 			continue;
 		if (!cold) {
 			ret = apple_sftl_load(sftl->ppn, &cold);
@@ -1835,6 +1934,9 @@ static int sftl_reclaim_retired(struct apple_sftl *sftl, u32 *claimed,
 		}
 		if (!sftl_retired_candidate(cold, block) ||
 		    cold->checkpoint_start != sftl->checkpoint_start ||
+		    cold->native_context != sftl->native_context ||
+		    (sftl->native_context && (cold->wear[block] != sftl->wear[block] ||
+					      cold->block_flags[block] != sftl->block_flags[block])) ||
 		    cold->lanes[block] != victim.lanes) {
 			ret = -EBADMSG;
 			break;
@@ -1843,6 +1945,9 @@ static int sftl_reclaim_retired(struct apple_sftl *sftl, u32 *claimed,
 		if (!ret)
 			ret = apple_sftl_gc_plan_retired(&active, &saved, &victim,
 							  cold->checkpoint_start);
+		if (!ret && sftl->native_context)
+			ret = sftl->checkpoint_ops->account_retired(sftl->checkpoint_priv, block,
+					sftl->wear[block], sftl->wear[block] + 1, APPLE_SFTL_PREPARE_RETIRED);
 		if (ret == -EOPNOTSUPP) {
 			ret = -ENOSPC;
 			continue;
@@ -1851,10 +1956,17 @@ static int sftl_reclaim_retired(struct apple_sftl *sftl, u32 *claimed,
 			break;
 		__set_bit(block, sftl->used);
 		ret = sftl_erase_verified(sftl, block, deadline);
+		if (!ret && sftl->native_context)
+			ret = sftl->checkpoint_ops->account_retired(sftl->checkpoint_priv, block,
+					sftl->wear[block], sftl->wear[block] + 1, APPLE_SFTL_FINISH_RETIRED);
 		if (ret) {
-			/* Never reissue an ambiguous, possibly partial erase. */
+			/* A partial erase or failed accounting leaves reuse unproved. */
 			sftl->failed = true;
 			break;
+		}
+		if (sftl->native_context) {
+			sftl->roles[block] = SFTL_CLEAN_FREE;
+			sftl->wear[block]++;
 		}
 		*claimed = block;
 		break;
@@ -1863,6 +1975,12 @@ static int sftl_reclaim_retired(struct apple_sftl *sftl, u32 *claimed,
 	kvfree(active.runs);
 	apple_sftl_free(cold);
 	return ret;
+}
+
+static bool sftl_native_data_site(struct apple_sftl *sftl, u32 block)
+{
+	return !sftl->native_context || (block < SFTL_BLOCKS - 32 &&
+					 !test_bit(block, sftl->unknown_lane_flags));
 }
 
 static int sftl_check_landing(struct apple_sftl *sftl, u32 block, unsigned long deadline)
@@ -1874,6 +1992,7 @@ static int sftl_check_landing(struct apple_sftl *sftl, u32 block, unsigned long 
 	 * in this transaction after verifying an ordinary closed donor.
 	 */
 	if (!block || block >= SFTL_SUBBLOCKS || !sftl->lanes[block] ||
+	    !sftl_native_data_site(sftl, block) ||
 	    (sftl->native_context && sftl->roles[block] != SFTL_CLEAN_FREE &&
 	     sftl->roles[block] != SFTL_CLOSED_DATA && sftl->roles[block] != SFTL_DIRTY_FREE) ||
 	    test_bit(block, sftl->reserved) || test_bit(block, sftl->vfl_reserved) ||
@@ -1892,6 +2011,7 @@ static int sftl_take_blank(struct apple_sftl *sftl, u32 *out, unsigned long dead
 	while (sftl->next_candidate < SFTL_SUBBLOCKS) {
 		block = sftl->next_candidate++;
 		if (!test_bit(block, sftl->candidates) || test_bit(block, sftl->used) ||
+		    !sftl_native_data_site(sftl, block) ||
 		    (sftl->native_context && (sftl->roles[block] != SFTL_CLEAN_FREE ||
 					      test_bit(block, sftl->fallback_occupied))) ||
 		    (sftl->checkpoint_ops && test_bit(block, sftl->checkpoint_used)) ||
@@ -2047,6 +2167,7 @@ static void sftl_adopt_checkpoint(struct apple_sftl *sftl, struct apple_sftl *co
 	sftl->native_context = cold->native_context;
 	memcpy(sftl->roles, cold->roles, sizeof(sftl->roles));
 	memcpy(sftl->block_flags, cold->block_flags, sizeof(sftl->block_flags));
+	memcpy(sftl->wear, cold->wear, sizeof(sftl->wear));
 	for (block = 0; block < ARRAY_SIZE(sftl->candidates); block++)
 		sftl->candidates[block] &= cold->candidates[block];
 	memcpy(sftl->fallback_occupied, cold->fallback_occupied, sizeof(sftl->fallback_occupied));
@@ -2061,10 +2182,8 @@ static void sftl_adopt_checkpoint(struct apple_sftl *sftl, struct apple_sftl *co
 			__set_bit(block, sftl->used);
 }
 
-/* A native save on this profile uses two named normal-view context blocks.
- * Only accept a complete generation starting at page zero of the active block,
- * with a blank second block. The old generation remains readable while the
- * alternate is programmed. Both blocks must be exclusively context-owned.
+/* The native base lists capacity allocated to this generation. Retirement
+ * operates on the previous generation's occupied sites independently.
  */
 static bool sftl_owns_context_block(struct apple_sftl *sftl, u32 block)
 {
@@ -2074,25 +2193,23 @@ static bool sftl_owns_context_block(struct apple_sftl *sftl, u32 block)
 		!test_bit(block, sftl->unknown_lane_flags) && !test_bit(block, sftl->checkpoint_used);
 }
 
-static int sftl_native_pair(struct apple_sftl *sftl, const struct apple_sftl_snapshot *saved,
-			    u32 blocks[2], unsigned long deadline)
+static int sftl_native_sites(struct apple_sftl *sftl, const struct apple_sftl_snapshot *saved,
+			     const u32 fresh[2], u32 *retiring, unsigned long deadline)
 {
 	const u8 *base = saved->opaque[0].data;
 	u64 length;
-	u32 slots, i, j;
+	u32 prior[2], slots, i, j;
 	unsigned int chunk;
 	bool blank;
 	int ret;
 
 	if (get_unaligned_le32(base) != 2 || !sftl->checkpoint_start)
 		return -EOPNOTSUPP;
-	blocks[0] = get_unaligned_le32(base + 8);
-	blocks[1] = get_unaligned_le32(base + 4);
-	if (!apple_sftl_account_context_pair(saved, blocks))
-		return -EOPNOTSUPP;
-	if (blocks[0] == blocks[1] || !sftl_owns_context_block(sftl, blocks[0]) ||
-	    !sftl_owns_context_block(sftl, blocks[1]) ||
-	    sftl->context.items[0].address != blocks[1] * SFTL_STRIDE)
+	prior[0] = get_unaligned_le32(base + 4);
+	prior[1] = get_unaligned_le32(base + 8);
+	if (!apple_sftl_account_context_pair(saved, prior) ||
+	    !sftl_owns_context_block(sftl, prior[0]) || !sftl_owns_context_block(sftl, prior[1]) ||
+	    sftl->context.items[0].address != prior[0] * SFTL_STRIDE)
 		return -EOPNOTSUPP;
 	for (i = 0; i < saved->nr_runs; i++) {
 		const struct apple_sftl_extent *r = &saved->runs[i];
@@ -2102,17 +2219,18 @@ static int sftl_native_pair(struct apple_sftl *sftl, const struct apple_sftl_sna
 			continue;
 		end = (r->provider + r->length - 1) / SFTL_STRIDE;
 		for (j = 0; j < 2; j++)
-			if (r->provider / SFTL_STRIDE <= blocks[j] && blocks[j] <= end)
+			if ((r->provider / SFTL_STRIDE <= fresh[j] && fresh[j] <= end) ||
+			    (r->provider / SFTL_STRIDE <= prior[j] && prior[j] <= end))
 				return -EBADMSG;
 	}
 	length = sftl->checkpoint_sequence - sftl->checkpoint_start + 1;
-	slots = hweight16(sftl->lanes[blocks[1]]) * 512;
+	slots = hweight16(sftl->lanes[prior[0]]) * 512;
 	if (!length || length % 4 || length > slots)
 		return -EOPNOTSUPP;
 	for (i = 0; i < slots; i += 4) {
 		if (time_after_eq(jiffies, deadline))
 			return -ETIMEDOUT;
-		ret = sftl_read_address(sftl, blocks[1] * SFTL_STRIDE + i, &chunk);
+		ret = sftl_read_address(sftl, prior[0] * SFTL_STRIDE + i, &chunk);
 		if (ret)
 			return ret;
 		if (i >= length) {
@@ -2129,8 +2247,19 @@ static int sftl_native_pair(struct apple_sftl *sftl, const struct apple_sftl_sna
 				return -EOPNOTSUPP;
 		}
 	}
-	ret = sftl_block_blank(sftl, blocks[0], deadline, &blank);
-	return ret ? ret : (blank ? 0 : -EOPNOTSUPP);
+	/* Require a single occupied old site and check all the fresh capacity
+	 * before the first data copy. The unused old reservation is left alone.
+	 */
+	ret = sftl_block_blank(sftl, prior[1], deadline, &blank);
+	if (ret || !blank)
+		return ret ? ret : -EOPNOTSUPP;
+	for (i = 0; i < 2; i++) {
+		ret = sftl_block_blank(sftl, fresh[i], deadline, &blank);
+		if (ret || !blank)
+			return ret ? ret : -EOPNOTSUPP;
+	}
+	*retiring = prior[0];
+	return 0;
 }
 
 static int sftl_context_program(void *priv, u32 address, const struct apple_sftl_gc_page *page)
@@ -2142,9 +2271,20 @@ static int sftl_context_program(void *priv, u32 address, const struct apple_sftl
 	return sftl_program_address(move->sftl, address, page->data, page->oob);
 }
 
+static int sftl_context_stats(void *priv, u32 id, u8 *data, size_t bytes)
+{
+	struct sftl_move *move = priv;
+	struct apple_sftl *sftl = move->sftl;
+
+	if (time_after_eq(jiffies, move->deadline))
+		return -ETIMEDOUT;
+	return sftl->checkpoint_ops->read_native_stats(sftl->checkpoint_priv, id, data, bytes);
+}
+
 static const struct apple_sftl_gc_io sftl_context_io = {
 	.read = sftl_move_read,
 	.program = sftl_context_program,
+	.read_native_stats = sftl_context_stats,
 };
 
 static int sftl_reload_plan(struct apple_sftl *sftl, struct apple_sftl_gc *gc,
@@ -2167,7 +2307,8 @@ static int sftl_reload_plan(struct apple_sftl *sftl, struct apple_sftl_gc *gc,
 	return ret;
 }
 
-static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long deadline)
+static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long deadline,
+			const u32 *fresh)
 {
 	struct apple_sftl_gc_block destination = {
 		.block = landing, .lanes = sftl->lanes[landing], .blank = true,
@@ -2177,7 +2318,7 @@ static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long dead
 	struct apple_sftl_snapshot *before = NULL;
 	struct apple_sftl_gc *gc = NULL;
 	struct apple_sftl *cold = NULL;
-	u32 blocks[SFTL_MAX_CONTEXTS], nr = ARRAY_SIZE(blocks), block, slots, i;
+	u32 blocks[SFTL_MAX_CONTEXTS], nr = ARRAY_SIZE(blocks), block, slots, i, retiring = 0;
 	int ret = -ENOSPC;
 
 	for (block = 1; block < SFTL_BLOCKS - 32; block++) {
@@ -2220,7 +2361,8 @@ static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long dead
 		}
 		if (sftl->checkpoint_ops->prepare_native) {
 			nr = 2;
-			ret = sftl_native_pair(sftl, before, blocks, deadline);
+			memcpy(blocks, fresh, nr * sizeof(*fresh));
+			ret = sftl_native_sites(sftl, before, blocks, &retiring, deadline);
 			if (!ret)
 				ret = apple_sftl_gc_prepare_native(gc, sftl->checkpoint_ops->prepare_native,
 						sftl->checkpoint_priv, blocks, hweight16(sftl->lanes[blocks[0]]) * 512);
@@ -2237,7 +2379,7 @@ static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long dead
 			u32 k;
 
 			if (!blocks[i] || blocks[i] >= SFTL_SUBBLOCKS || blocks[i] == block ||
-			    blocks[i] == landing || !test_bit(blocks[i], sftl->reserved)) {
+			    blocks[i] == landing || (!fresh && !test_bit(blocks[i], sftl->reserved))) {
 				ret = -EINVAL;
 				goto out;
 			}
@@ -2260,20 +2402,21 @@ static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long dead
 			}
 			goto failed;
 		}
-		ret = apple_sftl_gc_checkpoint(gc, blocks, nr, &image);
-		if (ret)
-			goto failed;
-		if (sftl->checkpoint_ops->prepare_native)
-			ret = apple_sftl_checkpoint_stage(image, blocks[0], sftl->lanes[blocks[0]],
-							  &sftl_context_io, &move, &readback);
-		else
+		if (sftl->checkpoint_ops->prepare_native) {
+			ret = apple_sftl_gc_stage_native(gc, blocks[0], sftl->lanes[blocks[0]],
+							 &sftl_context_io, &move, &readback);
+		} else {
+			ret = apple_sftl_gc_checkpoint(gc, blocks, nr, &image);
+			if (ret)
+				goto failed;
 			ret = sftl->checkpoint_ops->install(sftl->checkpoint_priv, image, &readback);
-		if (readback == image) {
-			readback = NULL;
-			ret = -EBADMSG;
-		} else if (readback && readback->records == image->records) {
-			readback->records = NULL;
-			ret = -EBADMSG;
+			if (readback == image) {
+				readback = NULL;
+				ret = -EBADMSG;
+			} else if (readback && readback->records == image->records) {
+				readback->records = NULL;
+				ret = -EBADMSG;
+			}
 		}
 		if (ret)
 			goto failed;
@@ -2291,12 +2434,24 @@ static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long dead
 			if (!cold->native_context || cold->roles[landing] != SFTL_OPEN_DATA ||
 			    cold->roles[block] != SFTL_DIRTY_FREE ||
 			    cold->context.items[0].address != blocks[0] * SFTL_STRIDE ||
+			    cold->roles[retiring] != SFTL_CONTEXT || !sftl_owns_context_block(cold, retiring) ||
 			    !sftl_owns_context_block(cold, blocks[0]) ||
 			    !sftl_owns_context_block(cold, blocks[1])) {
 				ret = -EBADMSG;
 				goto failed;
 			}
-			ret = sftl_erase_verified(sftl, blocks[1], deadline);
+			ret = sftl_erase_verified(sftl, retiring, deadline);
+			if (ret)
+				goto failed;
+			/* The persisted table precedes retirement. Reconcile only
+			 * the private runtime copy after the old erase succeeds.
+			 * The unused tail of the new group needs no physical erase.
+			 */
+			ret = apple_sftl_account_release(readback, retiring,
+							 APPLE_SFTL_RELEASED_CONTEXT);
+			if (!ret)
+				ret = apple_sftl_account_release(readback, blocks[1],
+								 APPLE_SFTL_RELEASED_CONTEXT);
 			if (ret)
 				goto failed;
 			ret = sftl_reload_plan(sftl, gc, &cold);
@@ -2313,6 +2468,14 @@ static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long dead
 		ret = sftl_erase_verified(sftl, block, deadline);
 		if (ret)
 			goto failed;
+		if (sftl->native_context) {
+			ret = apple_sftl_account_release(readback, block, APPLE_SFTL_ERASED_DONOR);
+			if (!ret)
+				ret = sftl->checkpoint_ops->finish_native(sftl->checkpoint_priv,
+								readback, retiring, blocks[1], block);
+			if (ret)
+				goto failed;
+		}
 		sftl_adopt_checkpoint(sftl, cold);
 		sftl->spare = block;
 		goto out;
@@ -2333,7 +2496,8 @@ static bool sftl_can_compact(struct apple_sftl *sftl)
 {
 	u32 block;
 
-	if (!sftl->checkpoint_ops || !sftl->ppn->ops->erase_block)
+	if (!sftl->checkpoint_ops || !sftl->ppn->ops->erase_block ||
+	    (!sftl->checkpoint_ops->prepare_native && !sftl->checkpoint_ops->install))
 		return false;
 	for (block = 1; block < SFTL_BLOCKS - 32; block++)
 		if (sftl_closed_candidate(sftl, block) && test_bit(block, sftl->checkpoint_used))
@@ -2341,9 +2505,9 @@ static bool sftl_can_compact(struct apple_sftl *sftl)
 	return false;
 }
 
-static int sftl_claim_block(struct apple_sftl *sftl)
+static int sftl_claim_data_block(struct apple_sftl *sftl, bool compact, const u32 *fresh,
+				 unsigned long deadline)
 {
-	unsigned long deadline = jiffies + SFTL_CLAIM_TIMEOUT;
 	u32 block, spare;
 	int ret;
 
@@ -2363,7 +2527,7 @@ static int sftl_claim_block(struct apple_sftl *sftl)
 			return ret;
 	}
 	/* Only reserve landing space when a complete commit backend exists. */
-	if (!test_bit(block, sftl->unknown_lane_flags) && sftl_can_compact(sftl)) {
+	if (!test_bit(block, sftl->unknown_lane_flags) && compact) {
 		ret = sftl_take_blank(sftl, &spare, deadline);
 		if (!ret)
 			sftl->spare = spare;
@@ -2382,7 +2546,7 @@ static int sftl_claim_block(struct apple_sftl *sftl)
 					sftl->spare = block;
 				return ret;
 			}
-			ret = sftl_compact(sftl, block, deadline);
+			ret = sftl_compact(sftl, block, deadline, fresh);
 			if (!ret || sftl->failed)
 				return ret;
 			if (ret != -ENOSPC && ret != -EOPNOTSUPP) {
@@ -2399,14 +2563,66 @@ static int sftl_claim_block(struct apple_sftl *sftl)
 	return 0;
 }
 
+static int sftl_claim_block(struct apple_sftl *sftl)
+{
+	unsigned long deadline = jiffies + SFTL_CLAIM_TIMEOUT;
+	bool compact = sftl_can_compact(sftl);
+	u32 fresh[2], count = ARRAY_SIZE(fresh), i;
+	int ret;
+
+	if (!compact || !sftl->native_context)
+		return sftl_claim_data_block(sftl, compact, NULL, deadline);
+	/* A healthy compacting writer needs space for both user data and a
+	 * distinct new context group. Reserve in memory before choosing data
+	 * space so a blank context site cannot also become the landing block.
+	 */
+	ret = sftl->checkpoint_ops->reserve(sftl->checkpoint_priv, fresh, &count);
+	if (ret == -ENOSPC || ret == -EOPNOTSUPP)
+		return sftl_claim_data_block(sftl, false, NULL, deadline);
+	if (ret)
+		return ret;
+	if (count != ARRAY_SIZE(fresh) || fresh[0] == fresh[1])
+		return -EBADMSG;
+	for (i = 0; i < count; i++) {
+		u32 b = fresh[i];
+
+		if (!b || b >= SFTL_BLOCKS - 32 || !sftl->lanes[b] ||
+		    sftl->roles[b] != SFTL_CLEAN_FREE || !test_bit(b, sftl->candidates) ||
+		    test_bit(b, sftl->used) || test_bit(b, sftl->checkpoint_used) ||
+		    test_bit(b, sftl->reserved) || test_bit(b, sftl->vfl_reserved) ||
+		    test_bit(b, sftl->unknown_lane_flags) || test_bit(b, sftl->fallback_occupied))
+			return -EBADMSG;
+	}
+	for (i = 0; i < count; i++)
+		__set_bit(fresh[i], sftl->used);
+	ret = sftl_claim_data_block(sftl, true, fresh, deadline);
+	for (i = 0; i < count; i++) {
+		if (test_bit(fresh[i], sftl->reserved))
+			continue;
+		__clear_bit(fresh[i], sftl->used);
+		sftl->next_candidate = min(sftl->next_candidate, fresh[i]);
+	}
+	if (ret == -ENOSPC && !sftl->failed)
+		return sftl_claim_data_block(sftl, false, NULL, deadline);
+	return ret;
+}
+
 void apple_sftl_set_checkpoint_ops(struct apple_sftl *sftl,
 				   const struct apple_sftl_checkpoint_ops *ops, void *priv)
 {
 	mutex_lock(&sftl->lock);
 	sftl->checkpoint_ops = NULL;
-	if (ops && ((sftl->native_context && ops->prepare_native && !ops->reserve && !ops->install) ||
-		    (!sftl->native_context && !ops->prepare_native && ops->reserve && ops->install)))
-		sftl->checkpoint_ops = ops;
+	if (ops) {
+		bool mixed = ops->prepare_native || ops->read_native_stats || ops->finish_native;
+
+		if (sftl->native_context && !ops->install) {
+			if ((ops->prepare_native && ops->read_native_stats && ops->finish_native && ops->reserve) ||
+			    (ops->account_retired && !mixed && !ops->reserve))
+				sftl->checkpoint_ops = ops;
+		} else if (!sftl->native_context && !mixed && !ops->account_retired && ops->reserve && ops->install) {
+			sftl->checkpoint_ops = ops;
+		}
+	}
 	sftl->checkpoint_priv = priv;
 	mutex_unlock(&sftl->lock);
 }

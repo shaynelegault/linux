@@ -160,9 +160,9 @@ void apple_sftl_checkpoint_free(struct apple_sftl_checkpoint *checkpoint)
 }
 EXPORT_SYMBOL_GPL(apple_sftl_checkpoint_free);
 
-int apple_sftl_checkpoint_build(const struct apple_sftl_snapshot *snapshot,
-				const u32 *blocks, u32 nr_blocks,
-				u32 max_records, struct apple_sftl_checkpoint **out)
+static int sftl_checkpoint_build(const struct apple_sftl_snapshot *snapshot,
+				 const u32 *blocks, u32 nr_blocks, u32 max_records,
+				 bool preserve_cached_stats, struct apple_sftl_checkpoint **out)
 {
 	struct apple_sftl_checkpoint *checkpoint;
 	u32 count, i, j, cursor = 0, run = 0, old_names;
@@ -231,7 +231,8 @@ int apple_sftl_checkpoint_build(const struct apple_sftl_snapshot *snapshot,
 		}
 	}
 	if (sftl_native_context(snapshot)) {
-		ret = apple_sftl_account_map(checkpoint, snapshot);
+		ret = preserve_cached_stats ? apple_sftl_account_saved_map(checkpoint, snapshot) :
+					      apple_sftl_account_map(checkpoint, snapshot);
 		if (ret) {
 			apple_sftl_checkpoint_free(checkpoint);
 			return ret;
@@ -239,6 +240,13 @@ int apple_sftl_checkpoint_build(const struct apple_sftl_snapshot *snapshot,
 	}
 	*out = checkpoint;
 	return 0;
+}
+
+int apple_sftl_checkpoint_build(const struct apple_sftl_snapshot *snapshot,
+				const u32 *blocks, u32 nr_blocks,
+				u32 max_records, struct apple_sftl_checkpoint **out)
+{
+	return sftl_checkpoint_build(snapshot, blocks, nr_blocks, max_records, false, out);
 }
 EXPORT_SYMBOL_GPL(apple_sftl_checkpoint_build);
 
@@ -480,9 +488,10 @@ static int sftl_gc_program(struct apple_sftl_gc_page *buffer,
 	return memcmp(page, buffer, sizeof(*page)) ? -EBADMSG : 0;
 }
 
-int apple_sftl_checkpoint_stage(const struct apple_sftl_checkpoint *image,
-				u32 block, u16 lanes, const struct apple_sftl_gc_io *io,
-				void *priv, struct apple_sftl_checkpoint **readback)
+static int sftl_checkpoint_stage(const struct apple_sftl_checkpoint *image,
+				 u32 block, u16 lanes, const struct apple_sftl_gc_io *io,
+				 void *priv, struct apple_sftl_checkpoint **readback,
+				 struct apple_sftl_gc *gc)
 {
 	struct apple_sftl_checkpoint *copy;
 	struct apple_sftl_gc_page *pages;
@@ -547,6 +556,15 @@ int apple_sftl_checkpoint_stage(const struct apple_sftl_checkpoint *image,
 		}
 	}
 	for (i = 0; i < image->count; i += 4) {
+		/* 13G36 samples both providers after the one-page base, before
+		 * formatting the statistics page. Keep these samples in the GC's
+		 * expected image for the independent readback comparison.
+		 */
+		if (gc && i == 4) {
+			ret = apple_sftl_account_read_stats(gc->checkpoint, io, priv);
+			if (ret)
+				goto out;
+		}
 		for (j = 0; j < 4; j++) {
 			memcpy(pages[1].data + j * APPLE_SFTL_CHUNK,
 			       image->records[i + j].data, APPLE_SFTL_CHUNK);
@@ -573,7 +591,33 @@ out:
 	apple_sftl_checkpoint_free(copy);
 	return ret;
 }
+
+int apple_sftl_checkpoint_stage(const struct apple_sftl_checkpoint *image,
+				u32 block, u16 lanes, const struct apple_sftl_gc_io *io,
+				void *priv, struct apple_sftl_checkpoint **readback)
+{
+	return sftl_checkpoint_stage(image, block, lanes, io, priv, readback, NULL);
+}
 EXPORT_SYMBOL_GPL(apple_sftl_checkpoint_stage);
+
+int apple_sftl_gc_stage_native(struct apple_sftl_gc *gc, u32 block, u16 lanes,
+			       const struct apple_sftl_gc_io *io, void *priv,
+			       struct apple_sftl_checkpoint **readback)
+{
+	int ret;
+
+	if (!readback)
+		return -EINVAL;
+	*readback = NULL;
+	if (!gc || gc->stage != APPLE_SFTL_GC_CHECKPOINT || gc->issued ||
+	    !gc->checkpoint || !io || !io->read_native_stats)
+		return -EINVAL;
+	gc->issued = true;
+	ret = sftl_checkpoint_stage(gc->checkpoint, block, lanes, io, priv, readback, gc);
+	if (ret)
+		gc->stage = APPLE_SFTL_GC_FAILED;
+	return ret;
+}
 
 /* No erase or map publication occurs here. Even an indeterminate program
  * consumes the transaction: the caller must recover before writing again.
@@ -669,8 +713,6 @@ int apple_sftl_gc_prepare_native(struct apple_sftl_gc *gc,
 	if (!gc || !prepare || !blocks || !capacity || gc->stage != APPLE_SFTL_GC_COPY ||
 	    gc->copied || gc->checkpoint)
 		return -EINVAL;
-	if (!apple_sftl_account_context_pair(&gc->snapshot, blocks))
-		return -EBADMSG;
 	/* The policy may change several fields before refusing a transition.
 	 * Keep its edits private so retries always begin with the original state.
 	 */
@@ -683,8 +725,8 @@ int apple_sftl_gc_prepare_native(struct apple_sftl_gc *gc,
 	ret = prepare(priv, staged.opaque, staged.nr_opaque, &staged,
 		      gc->victim, gc->destination, blocks);
 	if (!ret)
-		ret = apple_sftl_checkpoint_build(&staged, blocks, 2,
-						  min(gc->max_records, capacity), &image);
+		ret = sftl_checkpoint_build(&staged, blocks, 2, min(gc->max_records, capacity),
+					    true, &image);
 	if (!ret && !apple_sftl_account_gc_image(&gc->snapshot, image, blocks,
 						gc->victim, gc->destination,
 						apple_sftl_gc_copy_chunks(gc) - gc->padding,

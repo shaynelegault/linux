@@ -9,6 +9,11 @@
 
 struct apple_sftl;
 
+enum apple_sftl_retired_phase {
+	APPLE_SFTL_PREPARE_RETIRED,
+	APPLE_SFTL_FINISH_RETIRED,
+};
+
 /*
  * The native policy completes a planned accounting image in memory. The
  * core owns all I/O, verification and retirement of the old generation.
@@ -17,10 +22,28 @@ struct apple_sftl;
  * mutation the writer stops until a fresh recovery.
  */
 struct apple_sftl_checkpoint_ops {
-	/* With this policy the core stages and retires real context pages.
-	 * It is exclusive with the externally atomic reserve/install pair.
+	/* Alongside reserve and read_native_stats this stages a new native
+	 * context group. The old active site is discovered from durable pages.
 	 */
 	apple_sftl_prepare_accounting prepare_native;
+	/* Read the live native statistics after the base page has committed.
+	 * ID 255 is 88 bytes and ID 254 is 464. Return bytes copied or errno.
+	 */
+	int (*read_native_stats)(void *priv, u32 id, u8 *data, size_t bytes);
+	/* Reconcile the observed releases with the policy's runtime state
+	 * before the donor can be reused. The image is borrowed for this call.
+	 */
+	int (*finish_native)(void *priv, const struct apple_sftl_checkpoint *runtime,
+			     u32 old_context, u32 unused_context, u32 donor);
+	/* Direct reuse of an already dirty-free native donor. PREPARE verifies
+	 * current ownership without changing media. FINISH reconciles the
+	 * verified erase and wear in the runtime ledger before the first write.
+	 */
+	int (*account_retired)(void *priv, u32 block, u16 old_wear, u16 new_wear,
+			       enum apple_sftl_retired_phase phase);
+	/* Pure reservation proposal. On native media return two fresh sites
+	 * from the runtime allocation policy, or an error before any mutation.
+	 */
 	int (*reserve)(void *priv, u32 *blocks, u32 *nr_blocks);
 	int (*install)(void *priv, const struct apple_sftl_checkpoint *image,
 		       struct apple_sftl_checkpoint **readback);

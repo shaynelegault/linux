@@ -9,8 +9,8 @@ block. Reclamation must preserve the recovered map for the whole device.
 
 The block writer allocates from verified blank blocks. An optional, verified
 ``erase_block`` provider operation lets the allocator also reclaim obsolete
-blocks. With a complete native accounting policy the allocator can also stage
-a checkpoint in the alternate context block and relocate live data.
+blocks. With a complete native accounting policy the allocator can also
+reserve fresh context sites, relocate live data and publish a checkpoint.
 P105 H2FMI does not enable physical erase or supply this policy. When verified
 blank blocks run out on that profile, a write returns ``-ENOSPC``.
 
@@ -60,8 +60,10 @@ multiple of 64 records with subtype-4 padding. Each padding record
 consumes a sequence value. Full logical coverage alone cannot identify the
 last durable page of a native save.
 
-The encoder recomputes the valid logical-page count of every superblock and
-the associated global statistic (ID 9) from the whole planned map. Closing
+The encoder recomputes the valid logical-page count of every superblock
+from the planned map. The standalone map encoder also normalizes the
+global valid count. Native publication preserves the cached global
+statistics until a known firmware refresh. Closing
 a block or replaying a closed footer also updates its subtype-5 user
 sequence statistics. Each footer run supplies one sample.
 
@@ -71,28 +73,36 @@ one block from the data count to the free count. The native checkpoint
 writer can serialize the previous cached counts before that refresh. A
 policy must establish the point of serialization as well as the allocation,
 stream and wear transitions before allowing the first relocation write.
-The native formatter also queries its provider for two statistics payloads
-(IDs 255 and 254) on each save.
+The native formatter queries two providers after the base page succeeds
+and before writing the statistics page. The VFL record (ID 255) has 88
+bytes and the lower-provider record (ID 254) has 464. A short or failed
+sample stops publication with the old context intact. A provider can
+reproduce these records from a known seed, complete request batches and
+per-row completions. Missing events invalidate its later samples.
 
 Saving and recovering a native context
 --------------------------------------
 
-The measured two-block format names its active and alternate contexts in the
-base record. The writer verifies exclusive ownership of both and checks the
-old generation's complete extent and the alternate's erased contents. It
-programs the new context in 16 KiB units, reads back each page's data and
-metadata, then cold-loads the medium with both generations visible. The
-expected checkpoint sequence, target location, mapping and lane ownership
-must agree. It erases the old context one lane at a time, verifies it blank
-and cold-loads again before erasing the data donor.
+The base record names the capacity allocated to the new generation. The
+writer supports a bounded case with one occupied old site and two fresh,
+verified clean-free sites. It protects the fresh sites during data
+allocation. It checks that the old generation fits its first listed site,
+that the spare capacity is blank and that the whole map excludes the sites.
+After publishing to the first fresh site it cold-loads with both
+generations visible, erases the old occupied site and reloads again. The
+unused new site is released without issuing an erase. After the verified
+donor erase, the policy receives the runtime roles and incremented wear
+before the donor becomes available for reuse.
 
 Recovery selects a complete generation and replays later writes. A partially
 written native map batch can expose sequence values without revealing how
 many further values the interrupted operation reserved. Recovery from that
-state is read-only. When an interrupted retirement leaves older context
-fragments on some lanes, the complete newer generation must own the old
-site and the remaining records must be provably older. Ambiguous fragments,
-conflicting metadata and unaccounted journal gaps prevent recovery.
+state is read-only. Recovery checks unlisted native context-role sites
+independently. A partial retirement must be consistent with an older
+generation at that physical site, including its record offsets and lane
+order. An unreadable supplemental site precludes a writable recovery.
+Conflicting metadata, map ownership and unaccounted journal gaps prevent
+recovery.
 
 Relocating live data
 --------------------
@@ -154,8 +164,7 @@ each source page, incorporates table updates after the last complete
 checkpoint, verifies target erasure, and reads back the initial checkpoint,
 all 16 tables and the final checkpoint. It uses separately qualified SLC
 erase/program callbacks. Physical P105 supplies neither callback. VFL bank
-rotation is independent of alternating the normal-view SwissPPNFTL context
-blocks.
+rotation is independent of allocating normal-view SwissPPNFTL context sites.
 
 A fallback to older VFL replicas requires a complete agreeing quartet,
 validated references and unchanged addressable ownership. Recovery reports

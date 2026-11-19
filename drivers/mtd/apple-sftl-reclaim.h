@@ -85,6 +85,8 @@ struct apple_sftl_gc_page {
 struct apple_sftl_gc_io {
 	int (*read)(void *priv, u32 address, struct apple_sftl_gc_page *page);
 	int (*program)(void *priv, u32 address, const struct apple_sftl_gc_page *page);
+	/* Native context saves only. Return bytes copied or a negative errno. */
+	int (*read_native_stats)(void *priv, u32 id, u8 *data, size_t bytes);
 };
 
 /* Write a prepared context to an exclusively owned, entirely blank block.
@@ -94,10 +96,13 @@ struct apple_sftl_gc_io {
 int apple_sftl_checkpoint_stage(const struct apple_sftl_checkpoint *image,
 				u32 block, u16 lanes, const struct apple_sftl_gc_io *io,
 				void *priv, struct apple_sftl_checkpoint **readback);
+int apple_sftl_gc_stage_native(struct apple_sftl_gc *gc, u32 block, u16 lanes,
+			       const struct apple_sftl_gc_io *io, void *priv,
+			       struct apple_sftl_checkpoint **readback);
 
 /* Platform policy must account for the native roles, streams and counters of
  * the transition, or refuse it before any live data is moved. The two
- * context blocks are in new-active, old-active order.
+ * context blocks are fresh reservations for the new generation.
  */
 typedef int (*apple_sftl_prepare_accounting)(void *priv,
 		struct apple_sftl_context_record *opaque, u32 nr_opaque,

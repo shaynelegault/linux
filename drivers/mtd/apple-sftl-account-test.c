@@ -124,6 +124,10 @@ static void account_context_and_retired_donor(struct kunit *test)
 	struct apple_sftl_checkpoint image = {};
 	struct apple_sftl_snapshot snapshot = {};
 	u32 blocks[] = { 4, 1100 };
+	struct apple_sftl_runtime_stats counters = {
+		.valid = 300, .free = 11, .data = 11, .context = 2, .reserved = 4,
+		.stat37 = 44, .stat38_before_shift = 64063,
+	};
 	u8 footer[APPLE_SFTL_META] = { 0x1c, 8 };
 	u8 *p, *donor, *reads, *free, *data;
 
@@ -157,20 +161,108 @@ static void account_context_and_retired_donor(struct kunit *test)
 	footer[1] = 9;
 	KUNIT_EXPECT_EQ(test, apple_sftl_account_retire(&image, 1101, footer), -EOPNOTSUPP);
 	footer[1] = 8;
-	put_unaligned_le64(0, data);
-	KUNIT_EXPECT_EQ(test, apple_sftl_account_retire(&image, 1101, footer), -EBADMSG);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(reads), 517U);
 	KUNIT_EXPECT_EQ(test, donor[0], (u8)3);
-	put_unaligned_le64(12, data);
 	KUNIT_ASSERT_EQ(test, apple_sftl_account_retire(&image, 1101, footer), 0);
 	KUNIT_EXPECT_EQ(test, donor[0], (u8)9);
 	KUNIT_EXPECT_EQ(test, donor[1], (u8)8);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le16(donor + 6), 47);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(reads), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(free), 10ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(data), 12ULL);
+	KUNIT_EXPECT_EQ(test, apple_sftl_account_retire(&image, 1101, footer), -EOPNOTSUPP);
+	KUNIT_ASSERT_EQ(test, apple_sftl_account_refresh(&image, &counters), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(free), 11ULL);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(data), 11ULL);
-	KUNIT_EXPECT_EQ(test, apple_sftl_account_retire(&image, 1101, footer), -EOPNOTSUPP);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le64(free), 11ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(free + 27 * 16), 44ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(free + 28 * 16), 1000ULL);
+	KUNIT_ASSERT_EQ(test, apple_sftl_account_release(&image, 1101, APPLE_SFTL_ERASED_DONOR), 0);
+	KUNIT_EXPECT_EQ(test, donor[0], (u8)1);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(donor + 6), 48);
+	KUNIT_EXPECT_EQ(test, apple_sftl_account_release(&image, 1101, APPLE_SFTL_ERASED_DONOR),
+			-EOPNOTSUPP);
+	put_unaligned_le16(0, p + 2);
+	put_unaligned_le16(0xffff, p + 6);
+	KUNIT_EXPECT_EQ(test, apple_sftl_account_release(&image, 1100, APPLE_SFTL_RELEASED_CONTEXT),
+			-EOVERFLOW);
+	KUNIT_EXPECT_EQ(test, p[0], 7);
+	put_unaligned_le16(2, p + 6);
+	KUNIT_ASSERT_EQ(test, apple_sftl_account_release(&image, 1100, APPLE_SFTL_RELEASED_CONTEXT), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(p + 6), 3);
+}
+
+static void account_saved_counts_before_refresh(struct kunit *test)
+{
+	struct apple_sftl_extent runs[] = {
+		{ 0, 7, 2 * APPLE_SFTL_STRIDE },
+		{ 7, APPLE_SFTL_LOGICAL_PAGES - 7, APPLE_SFTL_NO_ADDRESS },
+	};
+	struct apple_sftl_snapshot map = { .runs = runs, .nr_runs = ARRAY_SIZE(runs) };
+	struct apple_sftl_checkpoint image = {};
+	u8 *valid, *entry;
+
+	account_fixture(test, &image);
+	KUNIT_ASSERT_NOT_NULL(test, image.records);
+	valid = image.records[4].data + TEST_VALID_STAT_OFFSET;
+	entry = image.records[8].data + 16;
+	put_unaligned_le64(12, valid);
+	put_unaligned_le16(6, entry + 2);
+	KUNIT_EXPECT_EQ(test, apple_sftl_account_map(&image, &map), -EBADMSG);
+	KUNIT_ASSERT_EQ(test, apple_sftl_account_saved_map(&image, &map), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(entry + 2), 7);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(valid), 12ULL);
+	put_unaligned_le64(APPLE_SFTL_LOGICAL_PAGES + 1, valid);
+	KUNIT_EXPECT_EQ(test, apple_sftl_account_saved_map(&image, &map), -EBADMSG);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(entry + 2), 7);
+}
+
+static void account_native_free_allocation(struct kunit *test)
+{
+	/* The native refill keeps six unsorted slots. Lower wear arriving
+	 * later replaces the first maximum, and ties retain their first slot.
+	 */
+	static const u8 dirty_wear[] = { 10, 12, 9, 9, 11, 15, 6, 7 };
+	struct apple_sftl_checkpoint image = {};
+	struct apple_sftl_snapshot snapshot = {};
+	struct apple_sftl_allocation plan = {};
+	u8 *table;
+	u32 i;
+
+	account_fixture(test, &image);
+	KUNIT_ASSERT_NOT_NULL(test, image.records);
+	snapshot.nr_opaque = APPLE_SFTL_ACCOUNT_RECORDS;
+	snapshot.opaque = image.records;
+	table = image.records[8].data;
+	KUNIT_EXPECT_EQ(test, apple_sftl_account_plan_allocation(&snapshot, &plan), -ENOSPC);
+	for (i = 0; i < ARRAY_SIZE(dirty_wear); i++) {
+		table[(i + 1) * 8] = i % 2 ? 2 : 9;
+		put_unaligned_le16(dirty_wear[i], table + (i + 1) * 8 + 6);
+	}
+	for (i = 20; i < 23; i++) {
+		table[i * 8] = 1;
+		put_unaligned_le16(7, table + i * 8 + 6);
+	}
+	KUNIT_ASSERT_EQ(test, apple_sftl_account_plan_allocation(&snapshot, &plan), 0);
+	KUNIT_EXPECT_EQ(test, plan.landing, 20);
+	KUNIT_EXPECT_EQ(test, plan.nr_erase, 3);
+	KUNIT_EXPECT_EQ(test, plan.erase[0], 1);
+	KUNIT_EXPECT_EQ(test, plan.erase[1], 8);
+	KUNIT_EXPECT_EQ(test, plan.erase[2], 3);
+
+	/* Wear savings greater than one select a dirty landing even when
+	 * the clean pool is full. A one-count difference prefers clean.
+	 */
+	for (i = 20; i < 26; i++) {
+		table[i * 8] = 1;
+		put_unaligned_le16(8, table + i * 8 + 6);
+	}
+	KUNIT_ASSERT_EQ(test, apple_sftl_account_plan_allocation(&snapshot, &plan), 0);
+	KUNIT_EXPECT_EQ(test, plan.landing, 7);
+	KUNIT_EXPECT_EQ(test, plan.nr_erase, 1);
+	KUNIT_EXPECT_EQ(test, plan.erase[0], 7);
+	put_unaligned_le16(1, table + 7 * 8 + 2);
+	KUNIT_EXPECT_EQ(test, apple_sftl_account_plan_allocation(&snapshot, &plan), -EBADMSG);
+	KUNIT_EXPECT_EQ(test, plan.landing, 7);
 }
 
 static struct kunit_case account_cases[] = {
@@ -178,6 +270,8 @@ static struct kunit_case account_cases[] = {
 	KUNIT_CASE(account_invalid_layout_or_map),
 	KUNIT_CASE(account_footer_user_sequence),
 	KUNIT_CASE(account_context_and_retired_donor),
+	KUNIT_CASE(account_native_free_allocation),
+	KUNIT_CASE(account_saved_counts_before_refresh),
 	{}
 };
 

@@ -20,6 +20,7 @@
 #define SFTL_READ_COUNT_START	28
 #define SFTL_SB_ENTRY_BYTES	8
 #define SFTL_SB_PER_RECORD	(APPLE_SFTL_CHUNK / SFTL_SB_ENTRY_BYTES)
+#define SFTL_MAX_WEAR		0xffff
 
 bool apple_sftl_native_context_tag(u32 index, const u8 *meta)
 {
@@ -103,6 +104,88 @@ static u8 *sftl_sb_entry(struct apple_sftl_context_record *records, u32 block)
 	return records[record].data + offset;
 }
 
+struct sftl_free_block {
+	u32 block;
+	u32 wear;
+};
+
+/* The refill list has six fixed slots, not a sorted wear queue. On equal
+ * wear the native scan keeps the first occurrence; refill uses slot order.
+ */
+static void sftl_add_dirty(struct sftl_free_block pool[], u32 block, u16 wear)
+{
+	u32 i, replace = 0;
+
+	for (i = 0; i < APPLE_SFTL_CLEAN_POOL; i++) {
+		if (pool[i].block == U32_MAX) {
+			replace = i;
+			break;
+		}
+		if (pool[i].wear > pool[replace].wear)
+			replace = i;
+	}
+	if (wear < pool[replace].wear)
+		pool[replace] = (struct sftl_free_block) { block, wear };
+}
+
+/* Healthy 13G36 free-block allocation at 0x810932f8. Firmware first
+ * replenishes the clean pool. It prefers a clean block within one wear
+ * count of the least worn free block, using the candidates from the scan
+ * before replenishment. A selected dirty block may already be in the pool.
+ */
+int apple_sftl_account_plan_allocation(const struct apple_sftl_snapshot *runtime,
+				       struct apple_sftl_allocation *plan)
+{
+	struct sftl_free_block pool[APPLE_SFTL_CLEAN_POOL];
+	struct sftl_free_block clean = { U32_MAX, U32_MAX }, least = clean;
+	struct apple_sftl_allocation result = {};
+	u32 i, nr_clean = 0;
+	bool erased = false;
+
+	if (!plan || !runtime || runtime->nr_opaque != APPLE_SFTL_ACCOUNT_RECORDS ||
+	    !sftl_native_prefix(runtime->opaque, runtime->nr_opaque))
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(pool); i++)
+		pool[i] = (struct sftl_free_block) { U32_MAX, SFTL_MAX_WEAR };
+	for (i = 0; i < APPLE_SFTL_SUBBLOCKS; i++) {
+		const u8 *entry = sftl_sb_entry(runtime->opaque, i);
+		u32 wear = get_unaligned_le16(entry + 6);
+
+		if (entry[0] != 1 && entry[0] != 2 && entry[0] != 9)
+			continue;
+		if (!i || get_unaligned_le16(entry + 2))
+			return -EBADMSG;
+		if (wear < least.wear)
+			least = (struct sftl_free_block) { i, wear };
+		if (entry[0] == 1) {
+			nr_clean++;
+			if (wear < clean.wear)
+				clean = (struct sftl_free_block) { i, wear };
+		} else {
+			sftl_add_dirty(pool, i, wear);
+		}
+	}
+	if (least.block == U32_MAX)
+		return -ENOSPC;
+	result.landing = least.wear + 1 < clean.wear ? least.block : clean.block;
+	for (i = 0; nr_clean < APPLE_SFTL_CLEAN_POOL && i < ARRAY_SIZE(pool); i++) {
+		if (pool[i].block == U32_MAX)
+			break;
+		result.erase[result.nr_erase++] = pool[i].block;
+		erased |= pool[i].block == result.landing;
+		nr_clean++;
+	}
+	if (!erased && sftl_sb_entry(runtime->opaque, result.landing)[0] != 1) {
+		/* The native halfword wraps. Leave that policy unqualified. */
+		if (least.wear == SFTL_MAX_WEAR)
+			return -EOVERFLOW;
+		result.erase[result.nr_erase++] = result.landing;
+	}
+	*plan = result;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_sftl_account_plan_allocation);
+
 static bool sftl_account_context_pair(struct apple_sftl_context_record *records, u32 count,
 				      const u32 blocks[2])
 {
@@ -141,20 +224,41 @@ bool apple_sftl_account_gc_image(const struct apple_sftl_snapshot *before,
 				 const struct apple_sftl_checkpoint *image, const u32 blocks[2],
 				 u32 donor, u32 landing, u32 live, u16 footer_chunks)
 {
-	u32 block, seen = 0, reads_per_record = APPLE_SFTL_CHUNK / sizeof(u32);
+	u32 block, old, i, seen = 0, reads_per_record = APPLE_SFTL_CHUNK / sizeof(u32);
 	const u8 *old_source, *source, *destination, *reads;
 
-	if (image->count <= APPLE_SFTL_ACCOUNT_RECORDS ||
+	if (!sftl_native_prefix(before->opaque, before->nr_opaque) ||
+	    image->count <= APPLE_SFTL_ACCOUNT_RECORDS ||
 	    !sftl_account_context_pair(image->records, image->count, blocks) ||
 	    !donor || donor >= APPLE_SFTL_SUBBLOCKS || !landing || landing >= APPLE_SFTL_SUBBLOCKS ||
 	    !live || footer_chunks < 4 || footer_chunks > 32 || footer_chunks % 4)
 		return false;
+	/* This bounded path retires one previously occupied context block.
+	 * The save names freshly allocated sites and still serializes the old
+	 * role/wear before any retirement, including when the old site is full.
+	 */
+	old = get_unaligned_le32(before->opaque[0].data + 4);
+	if (!old || old >= APPLE_SFTL_SUBBLOCKS || old == blocks[0] || old == blocks[1] ||
+	    sftl_sb_entry(before->opaque, old)[0] != 7 ||
+	    get_unaligned_le16(sftl_sb_entry(before->opaque, old) + 6) == SFTL_MAX_WEAR ||
+	    memcmp(sftl_sb_entry(before->opaque, old), sftl_sb_entry(image->records, old), 8))
+		return false;
+	for (i = 0; i < 2; i++) {
+		const u8 *prior = sftl_sb_entry(before->opaque, blocks[i]);
+		const u8 *next = sftl_sb_entry(image->records, blocks[i]);
+
+		if (prior[0] != 1 || get_unaligned_le16(prior + 2) ||
+		    (i == 1 && get_unaligned_le16(prior + 6) == SFTL_MAX_WEAR) ||
+		    get_unaligned_le16(prior + 6) != get_unaligned_le16(next + 6))
+			return false;
+	}
 	old_source = sftl_sb_entry(before->opaque, donor);
 	source = sftl_sb_entry(image->records, donor);
 	destination = sftl_sb_entry(image->records, landing);
 	reads = image->records[SFTL_READ_COUNT_START + donor / reads_per_record].data +
 		(donor % reads_per_record) * sizeof(u32);
 	if (old_source[0] != 3 || source[0] != 9 || source[1] != old_source[1] ||
+	    get_unaligned_le16(source + 6) == SFTL_MAX_WEAR ||
 	    source[1] >> 1 != footer_chunks ||
 	    get_unaligned_le16(source + 6) != get_unaligned_le16(old_source + 6) ||
 	    get_unaligned_le16(source + 2) || get_unaligned_le32(reads) ||
@@ -205,7 +309,7 @@ static int sftl_account_layout(const struct apple_sftl_checkpoint *image)
 	return 0;
 }
 
-static u8 *sftl_stats(struct apple_sftl_checkpoint *image)
+static u8 *sftl_stats(struct apple_sftl_checkpoint *image, u8 **provider_stats)
 {
 	u8 *payload = image->records[SFTL_STATS_START].data;
 	u32 i, offset = sizeof(u32);
@@ -228,9 +332,29 @@ static u8 *sftl_stats(struct apple_sftl_checkpoint *image)
 		    (i == 43 && (id != 255 || words != 22)) ||
 		    (i == 44 && (id != 254 || words != 116)))
 			return NULL;
+		if (provider_stats && i >= 43)
+			provider_stats[i - 43] = payload + offset;
 		offset += words * 4;
 	}
 	return payload;
+}
+
+/* Native cxtSave writes its base page before fetching these two records.
+ * The caller owns the pending image and discards it upon a short/error read.
+ */
+int apple_sftl_account_read_stats(struct apple_sftl_checkpoint *image,
+				  const struct apple_sftl_gc_io *io, void *priv)
+{
+	u8 *data[2];
+	int ret;
+
+	if (!sftl_stats(image, data))
+		return -EBADMSG;
+	ret = io->read_native_stats(priv, 255, data[0], 88);
+	if (ret != 88)
+		return ret < 0 ? ret : -EIO;
+	ret = io->read_native_stats(priv, 254, data[1], 464);
+	return ret == 464 ? 0 : (ret < 0 ? ret : -EIO);
 }
 
 /* sftl_stats has checked all of the fixed-size leading counters. */
@@ -245,8 +369,7 @@ static u8 *sftl_stat(u8 *stats, u32 id)
 int apple_sftl_account_retire(struct apple_sftl_checkpoint *image, u32 block, const u8 *footer_meta)
 {
 	u32 reads_per_record = APPLE_SFTL_CHUNK / sizeof(u32);
-	u8 *entry, *reads, *stats;
-	u64 data, free;
+	u8 *entry, *reads;
 	u16 chunks;
 	int ret;
 
@@ -262,25 +385,77 @@ int apple_sftl_account_retire(struct apple_sftl_checkpoint *image, u32 block, co
 	entry = sftl_sb_entry(image->records, block);
 	if (entry[0] != 3 || entry[1] != footer_meta[1] || get_unaligned_le16(entry + 2))
 		return -EOPNOTSUPP;
-	stats = sftl_stats(image);
-	if (!stats)
-		return -EOPNOTSUPP;
-	free = get_unaligned_le64(sftl_stat(stats, 10));
-	data = get_unaligned_le64(sftl_stat(stats, 11));
-	if (free >= APPLE_SFTL_SUBBLOCKS || !data || data > APPLE_SFTL_SUBBLOCKS - free)
-		return -EBADMSG;
 	reads = image->records[SFTL_READ_COUNT_START + block / reads_per_record].data +
 		(block % reads_per_record) * sizeof(u32);
-	/* cxt's stats IDs 10/11 copy native free/data counts (0x81094be2).
-	 * Final invalidation clears reads and moves one block at 0x81090ade.
+	/* At 0x81090ade final invalidation only updates the entry and runtime
+	 * totals. A save can see the previous cached free and data statistics.
 	 */
 	entry[0] = 9;
 	put_unaligned_le32(0, reads);
-	put_unaligned_le64(free + 1, sftl_stat(stats, 10));
-	put_unaligned_le64(data - 1, sftl_stat(stats, 11));
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_sftl_account_retire);
+
+int apple_sftl_account_release(struct apple_sftl_checkpoint *image, u32 block,
+			       enum apple_sftl_release event)
+{
+	u8 *entry;
+	u16 wear;
+	int ret;
+
+	if (!image || !image->records || !block || block >= APPLE_SFTL_SUBBLOCKS ||
+	    (event != APPLE_SFTL_ERASED_DONOR && event != APPLE_SFTL_RELEASED_CONTEXT))
+		return -EINVAL;
+	ret = sftl_account_layout(image);
+	if (ret)
+		return ret;
+	entry = sftl_sb_entry(image->records, block);
+	if (entry[0] != (event == APPLE_SFTL_ERASED_DONOR ? 9 : 7) ||
+	    get_unaligned_le16(entry + 2))
+		return -EOPNOTSUPP;
+	wear = get_unaligned_le16(entry + 6);
+	if (wear == SFTL_MAX_WEAR)
+		return -EOVERFLOW;
+	/* 0x81093958 follows completed ordinary erase; 0x81093848 also
+	 * counts release of an unused context, which requires no erase.
+	 */
+	entry[0] = 1;
+	put_unaligned_le16(wear + 1, entry + 6);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_sftl_account_release);
+
+/* These seven fields, and only these fields, are sampled by 0x81094bcc.
+ * Call only at the observed refresh boundary, with current runtime inputs.
+ */
+int apple_sftl_account_refresh(struct apple_sftl_checkpoint *image,
+			       const struct apple_sftl_runtime_stats *runtime)
+{
+	u8 *stats;
+	int ret;
+
+	if (!image || !image->records || !runtime)
+		return -EINVAL;
+	ret = sftl_account_layout(image);
+	if (ret)
+		return ret;
+	stats = sftl_stats(image, NULL);
+	if (!stats)
+		return -EOPNOTSUPP;
+	if (runtime->valid > APPLE_SFTL_LOGICAL_PAGES ||
+	    (u64)runtime->free + runtime->data + runtime->context + runtime->reserved >
+			APPLE_SFTL_SUBBLOCKS)
+		return -EBADMSG;
+	put_unaligned_le64(runtime->valid, sftl_stat(stats, 9));
+	put_unaligned_le64(runtime->free, sftl_stat(stats, 10));
+	put_unaligned_le64(runtime->data, sftl_stat(stats, 11));
+	put_unaligned_le64(runtime->context, sftl_stat(stats, 12));
+	put_unaligned_le64(runtime->reserved, sftl_stat(stats, 13));
+	put_unaligned_le64(runtime->stat37, sftl_stat(stats, 37));
+	put_unaligned_le64(runtime->stat38_before_shift >> 6, sftl_stat(stats, 38));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_sftl_account_refresh);
 
 static int sftl_account_runs(const struct apple_sftl_snapshot *map, u16 *counts, u32 *total)
 {
@@ -313,11 +488,11 @@ static int sftl_account_runs(const struct apple_sftl_snapshot *map, u16 *counts,
 	return cursor == APPLE_SFTL_LOGICAL_PAGES ? 0 : -EBADMSG;
 }
 
-int apple_sftl_account_map(struct apple_sftl_checkpoint *image,
-			   const struct apple_sftl_snapshot *map)
+static int sftl_update_map_counts(struct apple_sftl_checkpoint *image,
+				  const struct apple_sftl_snapshot *map, bool preserve_cache)
 {
 	u32 old_total = 0, total = 0, block;
-	u8 *valid;
+	u8 *valid, *stats;
 	u16 *counts;
 	int ret;
 
@@ -327,10 +502,10 @@ int apple_sftl_account_map(struct apple_sftl_checkpoint *image,
 	ret = sftl_account_layout(image);
 	if (ret)
 		return ret;
-	valid = sftl_stats(image);
-	if (!valid)
+	stats = sftl_stats(image, NULL);
+	if (!stats)
 		return -EOPNOTSUPP;
-	valid = sftl_stat(valid, 9);
+	valid = sftl_stat(stats, 9);
 	for (block = 0; block < APPLE_SFTL_SUBBLOCKS; block++) {
 		u16 n = get_unaligned_le16(sftl_sb_entry(image->records, block) + 2);
 
@@ -338,8 +513,17 @@ int apple_sftl_account_map(struct apple_sftl_checkpoint *image,
 			return -EBADMSG;
 		old_total += n;
 	}
-	if (get_unaligned_le64(valid) != old_total)
+	if (preserve_cache) {
+		u32 id;
+
+		if (get_unaligned_le64(valid) > APPLE_SFTL_LOGICAL_PAGES)
+			return -EBADMSG;
+		for (id = 10; id <= 13; id++)
+			if (get_unaligned_le64(sftl_stat(stats, id)) > APPLE_SFTL_SUBBLOCKS)
+				return -EBADMSG;
+	} else if (get_unaligned_le64(valid) != old_total) {
 		return -EBADMSG;
+	}
 
 	counts = kcalloc(APPLE_SFTL_SUBBLOCKS, sizeof(*counts), GFP_NOIO);
 	if (!counts)
@@ -348,9 +532,23 @@ int apple_sftl_account_map(struct apple_sftl_checkpoint *image,
 	if (!ret) {
 		for (block = 0; block < APPLE_SFTL_SUBBLOCKS; block++)
 			put_unaligned_le16(counts[block], sftl_sb_entry(image->records, block) + 2);
-		put_unaligned_le64(total, valid);
+		if (!preserve_cache)
+			put_unaligned_le64(total, valid);
 	}
 	kfree(counts);
 	return ret;
 }
+
+int apple_sftl_account_map(struct apple_sftl_checkpoint *image,
+			   const struct apple_sftl_snapshot *map)
+{
+	return sftl_update_map_counts(image, map, false);
+}
 EXPORT_SYMBOL_GPL(apple_sftl_account_map);
+
+int apple_sftl_account_saved_map(struct apple_sftl_checkpoint *image,
+				 const struct apple_sftl_snapshot *map)
+{
+	return sftl_update_map_counts(image, map, true);
+}
+EXPORT_SYMBOL_GPL(apple_sftl_account_saved_map);
