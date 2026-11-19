@@ -33,5 +33,6 @@ obj-$(CONFIG_MTD_UBI)		+= ubi/
 obj-$(CONFIG_MTD_HYPERBUS)	+= hyperbus/
 
 obj-$(CONFIG_MTD_APPLE_SFTL) += apple-sftl.o
-apple-sftl-y := apple-sftl-core.o apple-sftl-block.o
+apple-sftl-y := apple-sftl-core.o apple-sftl-block.o apple-sftl-reclaim.o
 obj-$(CONFIG_MTD_APPLE_SFTL_KUNIT_TEST) += apple-sftl-test.o
+obj-$(CONFIG_MTD_APPLE_SFTL_KUNIT_TEST) += apple-sftl-reclaim-test.o

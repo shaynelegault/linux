@@ -226,8 +226,9 @@ config MTD_APPLE_SFTL_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Synthesize complete VFL/SFTL media and exercise checkpoint recovery,
-	  native block summaries and open-block journal replay. Malformed
-	  replicas and unsupported layouts must fail without storage writes.
+	  native block summaries, open-block journal replay, checkpoint encoding
+	  and offline reclamation transactions. Malformed replicas and unsupported
+	  layouts must fail without storage writes.
 	  Also test complete programs, interrupted summaries, allocation
 	  limits and fresh-loader replay.
 	  All test media and provider operations are synthetic.
