@@ -101,6 +101,30 @@ static void h2fmi_row_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, row, 0xc27ffU);
 }
 
+static void h2fmi_erase_row_test(struct kunit *test)
+{
+	u8 params[H2FMI_PARAMS_SIZE];
+	struct h2fmi_geometry g;
+	u32 row = 0xdeadbeef;
+
+	h2fmi_test_params(params, ppn_16gb);
+	KUNIT_ASSERT_EQ(test, h2fmi_parse_geometry(params, sizeof(params), &g), 0);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 0, 1, &row), -EOPNOTSUPP);
+	h2fmi_test_params(params, ppn_64gb);
+	KUNIT_ASSERT_EQ(test, h2fmi_parse_geometry(params, sizeof(params), &g), 0);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 8, 1, &row), -EINVAL);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 0, 2088, &row), -EINVAL);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 0, 0, &row), -EPERM);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 7, 2056, &row), -EPERM);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 7, 2086, &row), -EPERM);
+	KUNIT_EXPECT_EQ(test, h2fmi_erase_row(&g, 7, 2087, &row), -EPERM);
+	KUNIT_EXPECT_EQ(test, row, 0xdeadbeefU);
+	KUNIT_ASSERT_EQ(test, h2fmi_erase_row(&g, 0, 2048, &row), 0);
+	KUNIT_EXPECT_EQ(test, row, 0x40000U);
+	KUNIT_ASSERT_EQ(test, h2fmi_erase_row(&g, 1, 1, &row), 0);
+	KUNIT_EXPECT_EQ(test, row, 0x80080U);
+}
+
 static void h2fmi_slc_row_test(struct kunit *test)
 {
 	u8 params[H2FMI_PARAMS_SIZE];
@@ -137,6 +161,23 @@ static void h2fmi_slc_row_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, h2fmi_slc_row(&g, 0, 0, 128, &row), -EINVAL);
 }
 
+static void h2fmi_raw_page_erased_test(struct kunit *test)
+{
+	u8 *raw = kunit_kmalloc(test, H2FMI_PAGE_RAW, GFP_KERNEL);
+	unsigned int status;
+
+	KUNIT_ASSERT_NOT_NULL(test, raw);
+	memset(raw, 0xff, H2FMI_PAGE_RAW);
+	for (status = 0; status <= 0xff; status++)
+		KUNIT_EXPECT_EQ(test, h2fmi_raw_page_erased(status, raw),
+				status == PPN_ST_ERASED);
+	raw[H2FMI_CHUNK_LO] = 0xfe;
+	KUNIT_EXPECT_FALSE(test, h2fmi_raw_page_erased(PPN_ST_ERASED, raw));
+	raw[H2FMI_CHUNK_LO] = 0xff;
+	raw[H2FMI_PAGE_RAW - 1] = 0x7f;
+	KUNIT_EXPECT_FALSE(test, h2fmi_raw_page_erased(PPN_ST_ERASED, raw));
+}
+
 static void h2fmi_status_test(struct kunit *test)
 {
 	unsigned int status;
@@ -170,6 +211,8 @@ static struct kunit_case h2fmi_test_cases[] = {
 	KUNIT_CASE(h2fmi_geometry_test),
 	KUNIT_CASE(h2fmi_invalid_geometry_test),
 	KUNIT_CASE(h2fmi_row_test),
+	KUNIT_CASE(h2fmi_erase_row_test),
+	KUNIT_CASE(h2fmi_raw_page_erased_test),
 	KUNIT_CASE(h2fmi_status_test),
 	KUNIT_CASE(h2fmi_slc_row_test),
 	KUNIT_CASE(h2fmi_program_status_test),

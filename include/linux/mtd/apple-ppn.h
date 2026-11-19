@@ -18,6 +18,13 @@ struct apple_ppn_ops {
 	int (*read_page)(void *priv, unsigned int bus, unsigned int cau,
 			 unsigned int block, unsigned int page, bool context,
 			 u8 *data, u8 *oob, u8 *status);
+	/* Optional. Caller owns the complete physical erase extent in all views.
+	 * Success means one normal-view CAU/block was erased and every byte
+	 * of data and OOB read back blank. On failure the extent may have
+	 * changed and must not be returned to the allocator.
+	 */
+	int (*erase_block)(void *priv, unsigned int bus, unsigned int cau,
+			   unsigned int block);
 };
 
 struct apple_ppn {

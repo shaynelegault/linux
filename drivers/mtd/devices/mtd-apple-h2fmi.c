@@ -22,8 +22,8 @@
  * CAU. Raw MTD offsets are independent of the iOS logical block addresses.
  *
  * Pages are read and programmed whole, data and metadata together.  The
- * driver has no erase: a page is only programmed when it reads back erased,
- * and every program is read back and compared before it is reported done.
+ * raw MTD devices provide no erase. A page is only programmed when it
+ * reads back erased, and every program is read back and compared.
  * Logical-address translation and allocation belong to the FTL above.
  */
 
@@ -38,6 +38,7 @@
 #include <linux/mtd/mtd.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 
 #include "mtd-apple-h2fmi.h"
@@ -73,7 +74,7 @@
 #define FMC_STATUS_MASK		0x4c
 
 /* Every command sequence the driver issues.  A sequence that is not listed
- * does not run; in particular there is no erase. */
+ * does not run. Only the single-row final erase command is needed. */
 static const u8 h2fmi_ops[][2] = {
 	{ 0x70, 0x00 },		/* read status */
 	{ 0x92, 0x97 },		/* PPN device parameters */
@@ -83,7 +84,8 @@ static const u8 h2fmi_ops[][2] = {
 	{ 0x0a, 0x37 },		/* PPN page read */
 	{ 0x8a, 0x00 },		/* PPN program, address phase */
 	{ 0x17, 0x00 },		/* PPN program confirm */
-	{ 0x79, 0x00 },		/* PPN program status */
+	{ 0x79, 0x00 },		/* PPN mutation status */
+	{ 0x6a, 0xd7 },		/* PPN erase, one normal row */
 };
 
 struct h2fmi_bus {
@@ -102,6 +104,10 @@ struct h2fmi_die {
 	u8 cau;
 };
 
+struct h2fmi_variant {
+	bool normal_erase_qualified;
+};
+
 struct h2fmi {
 	struct device *dev;
 	struct h2fmi_bus bus[H2FMI_BUSES];
@@ -109,6 +115,7 @@ struct h2fmi {
 	struct h2fmi_die *die;
 	unsigned int ndies;
 	struct platform_device *sftl;
+	struct apple_ppn_ops ppn_ops;
 };
 
 /*
@@ -418,7 +425,7 @@ static int h2fmi_data_in(struct h2fmi *fmi, struct h2fmi_bus *b,
 	return 0;
 }
 
-/* Program status uses 79, as in iBEC's write_bootpage path. */
+/* Both page programming and the iBEC erase queue use status command 79. */
 static int h2fmi_write_status(struct h2fmi *fmi, struct h2fmi_bus *b, u8 *status)
 {
 	int ret = h2fmi_cmd1(fmi, b, 0x79);
@@ -508,8 +515,7 @@ static int h2fmi_program_page(struct h2fmi *fmi, struct h2fmi_bus *b,
 				     b->page, H2FMI_PAGE_RAW, &status);
 	if (ret)
 		goto out;
-	if (status != PPN_ST_ERASED ||
-	    memchr_inv(b->page, 0xff, H2FMI_PAGE_RAW)) {
+	if (!h2fmi_raw_page_erased(status, b->page)) {
 		ret = -EEXIST;
 		goto out;
 	}
@@ -647,17 +653,84 @@ static int h2fmi_ppn_program(void *priv, unsigned int bus, unsigned int cau,
 	return h2fmi_program_page(fmi, &fmi->bus[bus], cau, block, page, data, oob);
 }
 
-static const struct apple_ppn_ops h2fmi_ppn_ops = {
-	.read_page = h2fmi_ppn_read,
-	.program_page = h2fmi_ppn_program,
-};
+/*
+ * The single-row iBEC erase queue sends 6A/D7, checks queue status (79)
+ * and operation status (77/7D), then ends the operation (77). Do not
+ * retry an uncertain erase. The caller holds the bus lock through readback.
+ */
+static int h2fmi_erase_transaction(struct h2fmi *fmi, struct h2fmi_bus *b, u32 row)
+{
+	u32 on, if_ctrl;
+	u8 queued = 0, completed = 0;
+	int ret;
+
+	if (b->failed)
+		return -EIO;
+	on = readl(b->fmc + FMC_ON);
+	if_ctrl = readl(b->fmc + FMC_IF_CTRL);
+	if (on != 5)
+		return -EIO;
+
+	writel(1u << H2FMI_CE, b->fmc + FMC_CE_CTRL);
+	h2fmi_clear_irqs(b);
+	ret = h2fmi_cmd_addr_cmd(fmi, b, 0x6a, 0xd7, row, 4);
+	if (!ret)
+		ret = h2fmi_write_status(fmi, b, &queued);
+	if (!ret)
+		ret = h2fmi_status(fmi, b, &completed);
+	if (!ret)
+		ret = h2fmi_cmd1(fmi, b, 0x77);
+	writel(0, b->fmc + FMC_CE_CTRL);
+	h2fmi_device_reset(b, on, if_ctrl);
+	if (!ret && (queued != PPN_ST_GOOD || completed != PPN_ST_GOOD)) {
+		dev_err(fmi->dev, "PPN erase row %08x: queue %02x, completion %02x\n",
+			row, queued, completed);
+		ret = -EIO;
+	}
+	return ret;
+}
+
+static int h2fmi_ppn_erase(void *priv, unsigned int bus, unsigned int cau,
+			   unsigned int block)
+{
+	struct h2fmi *fmi = priv;
+	struct h2fmi_bus *b;
+	unsigned int page;
+	u32 row;
+	u8 status;
+	int ret;
+
+	if (bus >= H2FMI_BUSES)
+		return -EINVAL;
+	b = &fmi->bus[bus];
+	ret = h2fmi_erase_row(&b->geometry, cau, block, &row);
+	if (ret)
+		return ret;
+
+	mutex_lock(&b->lock);
+	ret = h2fmi_erase_transaction(fmi, b, row);
+	for (page = 0; !ret && page < b->geometry.pages; page++) {
+		ret = h2fmi_read_transaction(fmi, b, 0x0a, 0x37, row + page, 4,
+					     b->page, H2FMI_PAGE_RAW, &status);
+		if (!ret && !h2fmi_raw_page_erased(status, b->page)) {
+			dev_err(fmi->dev, "PPN erase readback row %08x: status %02x\n",
+				row + page, status);
+			ret = -EIO;
+		}
+	}
+	if (ret)
+		b->failed = true;
+	mutex_unlock(&b->lock);
+	return ret;
+}
 
 static int h2fmi_register_sftl(struct h2fmi *fmi)
 {
+	const struct h2fmi_variant *variant = device_get_match_data(fmi->dev);
 	const struct h2fmi_geometry *g = &fmi->bus[0].geometry;
 	struct apple_ppn provider = {
 		.dev = fmi->dev,
-		.ops = &h2fmi_ppn_ops,
+		.ops = &fmi->ppn_ops,
 		.priv = fmi,
 		.buses = H2FMI_BUSES,
 		.caus = g->caus,
@@ -669,6 +742,10 @@ static int h2fmi_register_sftl(struct h2fmi *fmi)
 	if (!IS_ENABLED(CONFIG_MTD_APPLE_SFTL) || g->caus != 8 ||
 	    g->blocks != 2088 || g->pages != 128 || g->slc_pages != 64)
 		return 0;
+	fmi->ppn_ops.read_page = h2fmi_ppn_read;
+	fmi->ppn_ops.program_page = h2fmi_ppn_program;
+	if (variant && variant->normal_erase_qualified)
+		fmi->ppn_ops.erase_block = h2fmi_ppn_erase;
 	fmi->sftl = platform_device_register_data(fmi->dev, "apple-sftl",
 						 PLATFORM_DEVID_AUTO,
 						 &provider, sizeof(provider));
@@ -947,8 +1024,13 @@ static void h2fmi_remove(struct platform_device *pdev)
 		mtd_device_unregister(&fmi->mtd[i]);
 }
 
+/* Normal/SLC aliasing and the physical erase extent remain unqualified. */
+static const struct h2fmi_variant s5l8940x_ppn = {
+	.normal_erase_qualified = false,
+};
+
 static const struct of_device_id h2fmi_of_match[] = {
-	{ .compatible = "apple,s5l8940x-fmi" },
+	{ .compatible = "apple,s5l8940x-fmi", .data = &s5l8940x_ppn },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, h2fmi_of_match);

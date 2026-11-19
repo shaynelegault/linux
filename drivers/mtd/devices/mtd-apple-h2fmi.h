@@ -86,6 +86,22 @@ static inline int h2fmi_page_row(const struct h2fmi_geometry *g,
 	return 0;
 }
 
+/* The single-row erase trace is available only for the 64 GB package. */
+static inline int h2fmi_erase_row(const struct h2fmi_geometry *g,
+				 unsigned int cau, unsigned int block, u32 *row)
+{
+	if (g->caus != 8 || g->blocks != 2088 || g->pages != 128 ||
+	    g->slc_pages != 64 || g->page_bits != 7 ||
+	    g->block_bits != 12 || g->cau_bits != 3)
+		return -EOPNOTSUPP;
+	if (cau >= g->caus || block >= g->blocks)
+		return -EINVAL;
+	/* SLC-view bootstrap members may occupy any of the last 32 blocks. */
+	if (!block || block >= g->blocks - 32)
+		return -EPERM;
+	return h2fmi_page_row(g, cau, block, 0, row);
+}
+
 /* The VFL bootstrap's packed requests set the bit above the CAU field.
  * Keep this view separate from normal MTD offsets. Its address encoding
  * follows the saved firmware; live context selection is a separate step.
@@ -118,6 +134,11 @@ static inline int h2fmi_page_status(u8 status)
 	default:
 		return -EBADMSG;
 	}
+}
+
+static inline bool h2fmi_raw_page_erased(u8 status, const u8 *raw)
+{
+	return status == PPN_ST_ERASED && !memchr_inv(raw, 0xff, H2FMI_PAGE_RAW);
 }
 
 /* CMD 79 reports ready at bit 6 and program failure at bits 0 and 4. */
