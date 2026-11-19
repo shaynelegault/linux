@@ -33,6 +33,7 @@ struct apple_sftl_gc {
 	u32 nr_copies, copied, max_records, victim, destination;
 	u64 retire_sequence, copied_sequence, victim_sequence;
 	u32 padding;
+	u16 footer_chunks;
 	enum apple_sftl_gc_stage stage;
 };
 
@@ -314,6 +315,7 @@ int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,
 	gc->snapshot.journal_sequence = snapshot->journal_sequence;
 	gc->max_records = max_records;
 	gc->victim = victim->block;
+	gc->footer_chunks = victim->footer_chunks;
 	gc->destination = destination->block;
 	gc->retire_sequence = max(victim->last_sequence, snapshot->sequence);
 	gc->victim_sequence = victim->last_sequence;
@@ -659,17 +661,41 @@ int apple_sftl_gc_prepare_native(struct apple_sftl_gc *gc,
 		apple_sftl_prepare_accounting prepare, void *priv,
 		const u32 blocks[2], u32 capacity)
 {
+	struct apple_sftl_snapshot staged;
+	struct apple_sftl_checkpoint *image = NULL;
+	size_t size;
 	int ret;
 
 	if (!gc || !prepare || !blocks || !capacity || gc->stage != APPLE_SFTL_GC_COPY ||
 	    gc->copied || gc->checkpoint)
 		return -EINVAL;
-	ret = prepare(priv, gc->snapshot.opaque, gc->snapshot.nr_opaque, &gc->snapshot,
+	if (!apple_sftl_account_context_pair(&gc->snapshot, blocks))
+		return -EBADMSG;
+	/* The policy may change several fields before refusing a transition.
+	 * Keep its edits private so retries always begin with the original state.
+	 */
+	staged = gc->snapshot;
+	size = array_size(staged.nr_opaque, sizeof(*staged.opaque));
+	staged.opaque = kvmalloc(size, GFP_NOIO);
+	if (!staged.opaque)
+		return -ENOMEM;
+	memcpy(staged.opaque, gc->snapshot.opaque, size);
+	ret = prepare(priv, staged.opaque, staged.nr_opaque, &staged,
 		      gc->victim, gc->destination, blocks);
-	if (ret)
-		return ret;
-	return apple_sftl_checkpoint_build(&gc->snapshot, blocks, 2,
-					   min(gc->max_records, capacity), &gc->checkpoint);
+	if (!ret)
+		ret = apple_sftl_checkpoint_build(&staged, blocks, 2,
+						  min(gc->max_records, capacity), &image);
+	if (!ret && !apple_sftl_account_gc_image(&gc->snapshot, image, blocks,
+						gc->victim, gc->destination,
+						apple_sftl_gc_copy_chunks(gc) - gc->padding,
+						gc->footer_chunks)) {
+		apple_sftl_checkpoint_free(image);
+		ret = -EBADMSG;
+	}
+	if (!ret)
+		gc->checkpoint = image;
+	kvfree(staged.opaque);
+	return ret;
 }
 
 int apple_sftl_gc_checkpoint(struct apple_sftl_gc *gc, const u32 *blocks,

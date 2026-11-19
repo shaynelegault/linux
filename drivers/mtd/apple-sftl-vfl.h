@@ -32,6 +32,14 @@ struct apple_sftl_vfl_ops {
 		       u8 page, const u8 *data, const u8 *oob);
 };
 
+/* A mounted caller uses this entry point to serialize and revalidate its state. */
+int apple_sftl_rotate_vfl(struct apple_sftl *sftl, const struct apple_sftl_vfl_ops *ops,
+			 void *priv);
+
+int apple_sftl_vfl_rotate_checked(struct apple_ppn *ppn,
+				  const struct apple_sftl_vfl_source *source,
+				  const struct apple_sftl_vfl_ops *ops, void *priv,
+				  bool *started);
 int apple_sftl_vfl_rotate(struct apple_ppn *ppn,
 			  const struct apple_sftl_vfl_source *source,
 			  const struct apple_sftl_vfl_ops *ops, void *priv);

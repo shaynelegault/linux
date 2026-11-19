@@ -213,8 +213,9 @@ config MTD_APPLE_SFTL
 	  Recover the logical block medium stored in Apple VFL/SwissPPNFTL
 	  metadata on the measured 64 GB Hynix PPN layout. The H2FMI driver
 	  supplies canonical page reads through its aggregate PPN provider.
-	  Unsupported checkpoints, missing journal sequences and refresh
-	  requirements stop recovery before a disk is registered.
+	  Recovery can expose a complete older generation read-only after an
+	  interrupted native save. Unsupported geometry, conflicting replicas
+	  and unaccounted journal gaps stop recovery.
 
 	  Writes are appended to verified blank blocks. A provider with a
 	  qualified erase operation can also recycle verified retired blocks.
@@ -230,8 +231,8 @@ config MTD_APPLE_SFTL_KUNIT_TEST
 	  native block summaries, open-block journal replay, checkpoint encoding
 	  and verified reclamation during normal writes. Exercise failed erase,
 	  readback and recovery using synthetic flash.
-	  Also test complete programs, interrupted summaries, allocation
-	  limits and fresh-loader replay.
+	  Exercise native accounting, checkpoint page cuts, interrupted lane
+	  retirement, both replicated VFL banks and fresh-loader replay.
 	  All test media and provider operations are synthetic.
 
 source "drivers/mtd/chips/Kconfig"

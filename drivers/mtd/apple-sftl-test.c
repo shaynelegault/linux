@@ -6,9 +6,12 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#include <linux/vmalloc.h>
 
 #include "apple-sftl.h"
 #include "apple-sftl-reclaim.h"
+#include "apple-sftl-test-fixture.h"
+#include "apple-sftl-vfl.h"
 
 #define TEST_LOGICAL_PAGES 15625016U
 #define TEST_STRIDE 8192U
@@ -55,6 +58,12 @@ struct sftl_fixture {
 	struct apple_ppn_ops ops;
 	enum sftl_fault fault;
 	unsigned int reads;
+	bool rotating_vfl, vfl_table_changed, vfl_bad_age, vfl_stale_ref, vfl_age_collision;
+	unsigned int vfl_cut, vfl_target;
+	bool vfl_mount, slc_erased[8];
+	unsigned int slc_mutations, slc_fail;
+	struct sftl_test_page *slc[4][18];
+	u16 vfl_tail_marker;
 	unsigned int programs;
 	unsigned int fail_program;
 	unsigned int tear_program;
@@ -66,6 +75,12 @@ struct sftl_fixture {
 	unsigned int erase_pages;
 	bool checkpoint_slot, show_staged, checkpoint_published;
 	bool fail_reserve_once;
+	unsigned int corrupt_stage_readback;
+	unsigned int native_erase_cut, native_policy_calls;
+	u16 erased_context_lanes;
+	bool loaded_before_retirement, loaded_after_retirement;
+	int native_policy_error;
+	bool drop_context_role, keep_donor_role, duplicate_stream;
 	unsigned int installs, recovery_reads;
 	enum sftl_test_commit commit;
 	bool dirty_candidate;
@@ -107,24 +122,43 @@ static void sftl_test_members(struct sftl_fixture *f, u8 *data)
 static int sftl_test_context(struct sftl_fixture *f, unsigned int lane,
 			     unsigned int page, u8 *data, u8 *oob, u8 *status)
 {
-	unsigned int i;
+	unsigned int i, group = lane / 4, step = page * 4 + lane % 4;
+	bool target = f->rotating_vfl && group == f->vfl_target;
+	u32 origin = f->rotating_vfl ? (target ? 0xfffffe00 : 0xffffff00) :
+				      (group ? 0xffffff00 : 0xfffffe00);
+	u16 ref_group = target && !page ? 1 - group : group;
 
-	if (lane >= 8)
+	if (target && f->vfl_age_collision)
+		origin = 0xffffff00;
+	if (lane >= 8 || (target && step >= f->vfl_cut))
 		return 0;
-	if (!page) {
+	if (f->vfl_mount && f->slc_erased[lane]) {
+		struct sftl_test_page *row = lane >= 4 && page < 18 ? f->slc[lane - 4][page] : NULL;
+
+		if (row) {
+			memcpy(data, row->data, APPLE_PPN_PAGE_SIZE);
+			memcpy(oob, row->oob, APPLE_PPN_OOB_SIZE);
+			*status = 0x40;
+		}
+		return 0;
+	}
+	if (!page || page == 17 || (f->vfl_mount && !group && page > 17)) {
 		memset(data, 0, 16384);
 		put_unaligned_le16(16, data + 10);
 		put_unaligned_le16(2086, data + 12);
 		put_unaligned_le16(2086, data + 14);
 		sftl_test_members(f, data);
 		for (i = 0; i < 16; i++)
-			put_unaligned_le16(i + 1, data + 0x200 + i * 32);
+			put_unaligned_le16((ref_group << 15) | (i + 1), data + 0x200 + i * 32);
+		memset(oob, 0, 16);
 		oob[0] = 0x20;
 		oob[1] = 0xff;
 		oob[2] = 0xff;
 		oob[3] = 0;
-		put_unaligned_le32(lane < 4 ? 0xfffffff0 : 0xfffffff1, oob + 4);
-		if (f->fault == SFTL_CHECKPOINT_COPY && lane == 1)
+		put_unaligned_le32(origin - page, oob + 4);
+		if (f->vfl_stale_ref && target && !page)
+			put_unaligned_le16((f->vfl_target << 15) | 1, data + 0x200);
+		if (f->fault == SFTL_CHECKPOINT_COPY && lane == 1 && page == 17)
 			data[0] ^= 1;
 		*status = 0x40;
 	} else if (page <= 16) {
@@ -144,8 +178,14 @@ static int sftl_test_context(struct sftl_fixture *f, unsigned int lane,
 			put_unaligned_le16(0, data + 2056 * 2);
 			put_unaligned_le16(0, data + 2057 * 2);
 		}
+		memset(oob, 0, 16);
 		oob[0] = 0x20;
 		oob[1] = page - 1;
+		put_unaligned_le32(origin - page + (target && f->vfl_bad_age), oob + 4);
+		if (target && f->vfl_tail_marker && page == 1)
+			put_unaligned_le16(f->vfl_tail_marker, data + 2 * 2086);
+		if (target && f->vfl_table_changed && page == 1)
+			put_unaligned_le16(0x8000, data + 2);
 		oob[2] = 0;
 		oob[3] = 0;
 		if (f->fault == SFTL_LANE_COPY && lane == 1 && page == 1)
@@ -270,6 +310,14 @@ static int sftl_test_read_page(void *priv, unsigned int bus, unsigned int cau,
 	memset(data, 0xff, 16384);
 	memset(oob, 0xff, 64);
 	*status = 0x49;
+	if (context && block == 2087 && !lane && !page && sftl_test_written(f, 2, 0, 23)) {
+		if (!f->erased_context_lanes)
+			f->loaded_before_retirement = true;
+		if (f->erased_context_lanes == 3)
+			f->loaded_after_retirement = true;
+	}
+	if (!context && block == 1 && (f->erased_context_lanes & (1U << lane)))
+		return 0;
 	if (context) {
 		if (block == 2087 || (f->vfl_candidate && block == 2056 && !lane))
 			return sftl_test_context(f, lane, page, data, oob, status);
@@ -482,6 +530,171 @@ static void sftl_test_reject_incomplete_or_ambiguous(struct kunit *test)
 		KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
 		apple_sftl_free(sftl);
 	}
+}
+
+static int sftl_test_slc_erase(void *priv, const struct apple_sftl_vfl_member *m)
+{
+	struct sftl_fixture *f = priv;
+
+	if (m->block != 2087 || m->lane < 4 || m->lane >= 8 || f->slc_erased[m->lane])
+		return -EINVAL;
+	f->slc_erased[m->lane] = true;
+	return ++f->slc_mutations == f->slc_fail ? -EIO : 0;
+}
+
+static int sftl_test_slc_program(void *priv, const struct apple_sftl_vfl_member *m,
+				 u8 page, const u8 *data, const u8 *oob)
+{
+	struct sftl_fixture *f = priv;
+	struct sftl_test_page *row;
+
+	if (m->block != 2087 || m->lane < 4 || m->lane >= 8 || page >= 18 ||
+	    !f->slc_erased[m->lane] || f->slc[m->lane - 4][page])
+		return -EINVAL;
+	row = kunit_kmalloc(f->test, sizeof(*row), GFP_KERNEL);
+	if (!row)
+		return -ENOMEM;
+	memcpy(row->data, data, APPLE_PPN_PAGE_SIZE);
+	memcpy(row->oob, oob, APPLE_PPN_OOB_SIZE);
+	f->slc[m->lane - 4][page] = row;
+	return ++f->slc_mutations == f->slc_fail ? -EIO : 0;
+}
+
+static void sftl_test_rotate_mounted(struct kunit *test)
+{
+	const struct apple_sftl_vfl_ops ops = {
+		.erase = sftl_test_slc_erase, .program = sftl_test_slc_program,
+	};
+	unsigned int fault;
+	u8 *data = kunit_kmalloc(test, 4096, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	for (fault = 0; fault < 2; fault++) {
+		struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+		struct apple_sftl_vfl_source source;
+		struct apple_sftl *sftl = NULL;
+		struct apple_sftl_info info;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		f->vfl_mount = true;
+		f->append_candidates = 1;
+		f->slc_fail = fault ? 2 : 0;
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		memset(data, 'N', 4096);
+		KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, 8, data, 1), 0);
+		if (fault) {
+			KUNIT_EXPECT_EQ(test, apple_sftl_rotate_vfl(sftl, &ops, f), -EIO);
+			KUNIT_EXPECT_EQ(test, f->slc_mutations, 2U);
+			KUNIT_EXPECT_EQ(test, apple_sftl_read(sftl, 8, data), -EIO);
+			KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, 9, data, 1), -EIO);
+		} else {
+			KUNIT_ASSERT_EQ(test, apple_sftl_rotate_vfl(sftl, &ops, f), 0);
+			KUNIT_EXPECT_EQ(test, f->slc_mutations, 76U);
+			KUNIT_ASSERT_EQ(test, apple_sftl_vfl_source(sftl, &source), 0);
+			KUNIT_EXPECT_EQ(test, source.group, (u8)1);
+			KUNIT_EXPECT_EQ(test, source.page, (u8)17);
+			/* This bank has unprogrammed space. A refused second
+			 * rotation must leave the mounted writer usable.
+			 */
+			KUNIT_EXPECT_EQ(test, apple_sftl_rotate_vfl(sftl, &ops, f), -EOPNOTSUPP);
+			KUNIT_EXPECT_EQ(test, f->slc_mutations, 76U);
+			KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 8, data), 0);
+			KUNIT_EXPECT_EQ(test, data[0], (u8)'N');
+			memset(data, 'O', 4096);
+			KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, 9, data, 1), 0);
+		}
+		apple_sftl_free(sftl);
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		apple_sftl_get_info(sftl, &info);
+		KUNIT_EXPECT_EQ(test, info.read_only, !!fault);
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 8, data), 0);
+		KUNIT_EXPECT_EQ(test, data[0], (u8)'N');
+		if (!fault) {
+			KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 9, data), 0);
+			KUNIT_EXPECT_EQ(test, data[0], (u8)'O');
+		}
+		apple_sftl_free(sftl);
+	}
+}
+
+/* Each native page has four independently programmed SLC replicas. */
+static void sftl_test_vfl_rotation_cuts(struct kunit *test)
+{
+	/* Initial header, sixteen lane tables and final header, four copies each. */
+	const unsigned int programs = 18 * 4;
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	u8 *data = kunit_kmalloc(test, 4096, GFP_KERNEL);
+	unsigned int group, cut;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	f->rotating_vfl = true;
+	for (group = 0; group < 2; group++) {
+		f->vfl_target = group;
+		for (cut = 0; cut <= programs; cut++) {
+			struct apple_sftl_vfl_source source;
+			struct apple_sftl_info info;
+			struct apple_sftl *sftl = NULL;
+
+			f->vfl_cut = cut;
+			KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+			apple_sftl_get_info(sftl, &info);
+			KUNIT_EXPECT_EQ(test, info.read_only, cut < programs);
+			KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 0, data), 0);
+			KUNIT_EXPECT_EQ(test, data[0], (u8)'C');
+			if (cut < programs) {
+				KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, 0, data, 1), -EROFS);
+				KUNIT_EXPECT_EQ(test, apple_sftl_vfl_source(sftl, &source), -EROFS);
+			} else {
+				KUNIT_ASSERT_EQ(test, apple_sftl_vfl_source(sftl, &source), 0);
+				KUNIT_EXPECT_EQ(test, source.group, (u8)group);
+				KUNIT_EXPECT_EQ(test, source.page, (u8)17);
+			}
+			apple_sftl_free(sftl);
+		}
+	}
+	KUNIT_EXPECT_EQ(test, f->programs, 0U);
+	KUNIT_EXPECT_EQ(test, f->erases, 0U);
+}
+
+static void sftl_test_vfl_rejects_ambiguous_tables(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->rotating_vfl = true;
+	f->vfl_target = 1;
+	f->vfl_cut = 8;
+	f->vfl_age_collision = true;
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+	f->vfl_age_collision = false;
+	f->vfl_tail_marker = 0x8003;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.read_only, true);
+	apple_sftl_free(sftl);
+	f->vfl_tail_marker = 3;
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+	f->vfl_tail_marker = 0;
+	f->vfl_table_changed = true;
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+	f->vfl_table_changed = false;
+	f->vfl_bad_age = true;
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+	/* Four agreeing tables at the right coordinate but from a newer cycle. */
+	f->vfl_bad_age = false;
+	f->vfl_stale_ref = true;
+	f->vfl_cut = 8;
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+	KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+	KUNIT_EXPECT_EQ(test, f->programs, 0U);
+	KUNIT_EXPECT_EQ(test, f->erases, 0U);
 }
 
 static void sftl_test_trim_then_overwrite(struct kunit *test)
@@ -1023,6 +1236,271 @@ static void sftl_test_append_rejects_invalid_window(struct kunit *test)
 	apple_sftl_free(sftl);
 }
 
+/* Block 7 is the single-lane staging destination in this fixture. */
+static int sftl_test_stage_read(void *priv, u32 addr, struct apple_sftl_gc_page *page)
+{
+	struct sftl_fixture *f = priv;
+	u32 chunk = addr - 7 * TEST_STRIDE;
+	u8 status;
+	int ret;
+
+	if (chunk >= 512 || (chunk & 3))
+		return -ERANGE;
+	ret = sftl_test_read_page(f, 0, 0, 7, chunk / 4, false, page->data, page->oob, &status);
+	if (!ret && status == 0x40 && f->corrupt_stage_readback == chunk / 4 + 1)
+		page->data[APPLE_PPN_PAGE_SIZE - 1] ^= 1;
+	return ret;
+}
+
+static int sftl_test_stage_program(void *priv, u32 addr, const struct apple_sftl_gc_page *page)
+{
+	u32 chunk = addr - 7 * TEST_STRIDE;
+
+	if (chunk >= 512 || (chunk & 3))
+		return -ERANGE;
+	return sftl_test_program_page(priv, 0, 0, 7, chunk / 4, page->data, page->oob);
+}
+
+static const struct apple_sftl_gc_io sftl_test_stage_io = {
+	.read = sftl_test_stage_read,
+	.program = sftl_test_stage_program,
+};
+
+/* Make the saved map span two physical program units by splitting its
+ * unmapped tail. The first three map fragments leave logical space uncovered.
+ * Both checkpoint generations are visible to every subsequent cold load.
+ */
+static int sftl_test_second_generation(struct sftl_fixture *f)
+{
+	struct apple_sftl_snapshot *snapshot = NULL, map;
+	struct apple_sftl_checkpoint *image = NULL, *readback = NULL;
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_extent *runs, *tail;
+	const u32 split = 1533, block = 7;
+	u32 last, i;
+	int ret;
+
+	f->checkpoint_slot = true;
+	f->show_staged = true;
+	ret = apple_sftl_load(&f->provider, &sftl);
+	if (ret)
+		return ret;
+	ret = apple_sftl_snapshot(sftl, 65536, &snapshot);
+	apple_sftl_free(sftl);
+	if (ret)
+		return ret;
+	map = *snapshot;
+	last = map.nr_runs - 1;
+	tail = &map.runs[last];
+	if (tail->provider != APPLE_SFTL_NO_ADDRESS || tail->length <= split) {
+		ret = -EINVAL;
+		goto out;
+	}
+	runs = kunit_kcalloc(f->test, map.nr_runs + split, sizeof(*runs), GFP_KERNEL);
+	if (!runs) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	memcpy(runs, map.runs, last * sizeof(*runs));
+	for (i = 0; i <= split; i++)
+		runs[last + i] = (struct apple_sftl_extent) {
+			.logical = tail->logical + i, .provider = APPLE_SFTL_NO_ADDRESS,
+			.length = i == split ? tail->length - split : 1,
+		};
+	map.runs = runs;
+	map.nr_runs += split;
+	ret = apple_sftl_checkpoint_build(&map, &block, 1, 8, &image);
+	if (ret)
+		goto out;
+	if (image->count != 8 || image->first_sequence != map.sequence + 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = apple_sftl_checkpoint_stage(image, block, 1, &sftl_test_stage_io, f, &readback);
+	if (ret) {
+		if (readback)
+			ret = -EINVAL;
+	} else if (!readback || readback->count != image->count ||
+		   memcmp(readback->records, image->records, image->count * sizeof(*image->records))) {
+		ret = -EBADMSG;
+	}
+out:
+	apple_sftl_checkpoint_free(readback);
+	apple_sftl_checkpoint_free(image);
+	apple_sftl_snapshot_free(snapshot);
+	return ret;
+}
+
+static void sftl_test_context_power_cuts(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct sftl_test_page *saved[2];
+	u8 *data = kunit_kmalloc(test, APPLE_SFTL_CHUNK, GFP_KERNEL);
+	unsigned int cut;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, sftl_test_second_generation(f), 0);
+	memcpy(saved, f->written[2], sizeof(saved));
+	for (cut = 0; cut <= 2; cut++) {
+		struct apple_sftl_info info;
+		struct apple_sftl *sftl = NULL;
+
+		f->written[2][0] = cut ? saved[0] : NULL;
+		f->written[2][1] = cut == 2 ? saved[1] : NULL;
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		apple_sftl_get_info(sftl, &info);
+		KUNIT_EXPECT_EQ(test, info.checkpoint_sequence,
+				cut == 2 ? TEST_APPEND_FIRST + 7 : TEST_CHECKPOINT);
+		KUNIT_EXPECT_EQ(test, info.sequence, TEST_APPEND_FIRST - 1 + 4 * cut);
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 0, data), 0);
+		sftl_test_expect_fill(test, data, 'C');
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 2, data), 0);
+		sftl_test_expect_fill(test, data, 'G');
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 6, data), 0);
+		sftl_test_expect_fill(test, data, 6);
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 2000, data), 0);
+		sftl_test_expect_fill(test, data, 0);
+		KUNIT_EXPECT_EQ(test, f->programs, 2U);
+		KUNIT_EXPECT_EQ(test, f->erases, 0U);
+		apple_sftl_free(sftl);
+	}
+}
+
+static void sftl_test_context_stage_failures(struct kunit *test)
+{
+	enum { BEFORE_PROGRAM, UNCERTAIN_PROGRAM, CORRUPT_READBACK };
+	unsigned int page, fault;
+
+	/* Losing power before either page, or losing its completion status,
+	 * leaves different bytes on the medium. Reload only what reached NAND.
+	 */
+	for (page = 1; page <= 2; page++) {
+		for (fault = BEFORE_PROGRAM; fault <= CORRUPT_READBACK; fault++) {
+			struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+			struct apple_sftl *sftl = NULL;
+			struct apple_sftl_info info;
+			u8 *data = kunit_kmalloc(test, APPLE_SFTL_CHUNK, GFP_KERNEL);
+			unsigned int persisted = fault == BEFORE_PROGRAM ? page - 1 : page;
+
+			KUNIT_ASSERT_NOT_NULL(test, f);
+			KUNIT_ASSERT_NOT_NULL(test, data);
+			if (fault == CORRUPT_READBACK) {
+				f->corrupt_stage_readback = page;
+			} else {
+				f->fail_program = page;
+				f->uncertain_program = fault == UNCERTAIN_PROGRAM;
+			}
+			KUNIT_EXPECT_LT(test, sftl_test_second_generation(f), 0);
+			KUNIT_EXPECT_EQ(test, f->programs, page);
+			KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+			apple_sftl_get_info(sftl, &info);
+			KUNIT_EXPECT_EQ(test, info.checkpoint_sequence,
+					persisted == 2 ? TEST_APPEND_FIRST + 7 : TEST_CHECKPOINT);
+			KUNIT_EXPECT_EQ(test, info.sequence, TEST_APPEND_FIRST - 1 + persisted * 4);
+			KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 2, data), 0);
+			sftl_test_expect_fill(test, data, 'G');
+			KUNIT_EXPECT_EQ(test, f->programs, page);
+			KUNIT_EXPECT_EQ(test, f->erases, 0U);
+			apple_sftl_free(sftl);
+		}
+	}
+}
+
+static void sftl_test_checkpoint_stage_protects_tail(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct sftl_test_page *dirty = kunit_kmalloc(test, sizeof(*dirty), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, dirty);
+	memset(dirty, 0xff, sizeof(*dirty));
+	dirty->data[sizeof(dirty->data) - 1] = 0;
+	KUNIT_ASSERT_EQ(test, sftl_test_program_page(f, 0, 0, 7, 127, dirty->data, dirty->oob), 0);
+	KUNIT_EXPECT_EQ(test, sftl_test_second_generation(f), -EBADMSG);
+	KUNIT_EXPECT_EQ(test, f->programs, 1U);
+	KUNIT_EXPECT_PTR_EQ(test, sftl_test_written(f, 2, 0, 0), NULL);
+	KUNIT_ASSERT_NOT_NULL(test, sftl_test_written(f, 2, 0, 127));
+	KUNIT_EXPECT_EQ(test, sftl_test_written(f, 2, 0, 127)->data[sizeof(dirty->data) - 1], 0);
+	KUNIT_EXPECT_EQ(test, f->erases, 0U);
+}
+
+static void sftl_test_context_torn_append_replay(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+	struct sftl_test_page *written;
+	u8 *data = kunit_kmalloc(test, APPLE_SFTL_CHUNK, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, sftl_test_second_generation(f), 0);
+	f->written[2][1] = NULL;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	memset(data, 'W', APPLE_SFTL_CHUNK);
+	KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, 2, data, 1), 0);
+	apple_sftl_free(sftl);
+	written = sftl_test_written(f, 0, 0, 0);
+	KUNIT_ASSERT_NOT_NULL(test, written);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(written->oob) >> 16, TEST_APPEND_FIRST + 4);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_get_info(sftl, &info);
+	KUNIT_EXPECT_EQ(test, info.checkpoint_sequence, TEST_CHECKPOINT);
+	KUNIT_EXPECT_EQ(test, info.sequence, TEST_APPEND_FIRST + 7);
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 2, data), 0);
+	sftl_test_expect_fill(test, data, 'W');
+	KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, 6, data), 0);
+	sftl_test_expect_fill(test, data, 6);
+	KUNIT_EXPECT_EQ(test, f->programs, 3U);
+	KUNIT_EXPECT_EQ(test, f->erases, 0U);
+	apple_sftl_free(sftl);
+}
+
+static void sftl_test_reject_corrupt_generation(struct kunit *test)
+{
+	enum { BAD_CURSOR, DUPLICATE_STAMP, MISSING_STAMP, ORPHAN_PAYLOAD, NO_COMPLETE, DATA_GAP };
+	unsigned int fault;
+
+	for (fault = BAD_CURSOR; fault <= DATA_GAP; fault++) {
+		struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+		struct apple_sftl *sftl = NULL;
+		struct sftl_test_page *page;
+		u8 *meta;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		KUNIT_ASSERT_EQ(test, sftl_test_second_generation(f), 0);
+		f->written[2][1] = NULL;
+		page = f->written[2][0];
+		meta = page->oob + 3 * APPLE_SFTL_META;
+		switch (fault) {
+		case BAD_CURSOR:
+			put_unaligned_le32(17, page->data + APPLE_SFTL_CHUNK);
+			break;
+		case DUPLICATE_STAMP:
+			memcpy(meta, meta - APPLE_SFTL_META, APPLE_SFTL_META);
+			break;
+		case MISSING_STAMP:
+			put_unaligned_le64((TEST_APPEND_FIRST + 4) << 16 | 0x041f, meta);
+			break;
+		case ORPHAN_PAYLOAD:
+			memset(meta, 0xff, APPLE_SFTL_META);
+			break;
+		case NO_COMPLETE:
+			f->fault = SFTL_INCOMPLETE_CONTEXT;
+			break;
+		case DATA_GAP:
+			f->fault = SFTL_JOURNAL_GAP;
+			break;
+		}
+		KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+		KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+		KUNIT_EXPECT_EQ(test, f->programs, 2U);
+		KUNIT_EXPECT_EQ(test, f->erases, 0U);
+		apple_sftl_free(sftl);
+	}
+}
+
 static void sftl_test_checkpoint_cold_roundtrip(struct kunit *test)
 {
 	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
@@ -1286,6 +1764,45 @@ static void sftl_test_gc_preserves_protected_blocks(struct kunit *test)
 	}
 }
 
+static void sftl_test_context_pins_fallback_blocks(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	struct apple_sftl_snapshot *snapshot = NULL;
+	struct apple_sftl *sftl = NULL;
+	u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	struct sftl_test_page *last;
+	unsigned int cut, programs;
+	u64 newest;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	f->checkpoint_slot = true;
+	KUNIT_ASSERT_EQ(test, sftl_test_gc_medium(f, data, GC_CHECKPOINT_BEFORE_OVERWRITE), 0);
+	KUNIT_ASSERT_EQ(test, sftl_test_second_generation(f), 0);
+	last = f->written[2][1];
+	newest = get_unaligned_le64(last->oob + 3 * APPLE_SFTL_META) >> 16;
+	programs = f->programs;
+	f->ops.erase_block = sftl_test_erase_block;
+	for (cut = 1; cut <= 2; cut++) {
+		f->written[2][1] = cut == 2 ? last : NULL;
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		KUNIT_ASSERT_EQ(test, apple_sftl_snapshot(sftl, 65536, &snapshot), 0);
+		KUNIT_EXPECT_EQ(test, snapshot->checkpoint_sequence,
+				cut == 2 ? newest : f->checkpoint->sequence);
+		KUNIT_EXPECT_EQ(test, snapshot->sequence, newest - (2 - cut) * 4);
+		apple_sftl_snapshot_free(snapshot);
+		KUNIT_ASSERT_EQ(test, apple_sftl_read(sftl, TEST_APPEND_BASE, data), 0);
+		sftl_test_expect_fill(test, data, 'L');
+		/* The older saved map still refers to block 5, now fully superseded. */
+		KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 480, data, 1),
+				-ENOSPC);
+		KUNIT_EXPECT_EQ(test, f->programs, programs);
+		KUNIT_EXPECT_EQ(test, f->erases, 0U);
+		apple_sftl_free(sftl);
+	}
+	apple_sftl_checkpoint_free(f->checkpoint);
+}
+
 static void sftl_test_gc_erase_failure(struct kunit *test)
 {
 	static const struct {
@@ -1482,6 +1999,346 @@ static void sftl_test_gc_relocated_data(struct kunit *test, struct apple_sftl *s
 	sftl_test_expect_fill(test, data, foreground);
 }
 
+/* Build a 96-record saved context from actual ordinary writes. The native
+ * shape has four chunks of base and a full padded batch of 64 map records.
+ * The old two-lane context really has records on both lanes.
+ */
+static int sftl_test_native_context(struct sftl_fixture *f)
+{
+	struct apple_sftl_snapshot *snapshot = NULL, map;
+	struct apple_sftl_checkpoint *image = NULL;
+	struct apple_sftl *sftl = NULL;
+	const u32 blocks[] = { 1, 7 };
+	int ret;
+
+	ret = apple_sftl_load(&f->provider, &sftl);
+	if (ret)
+		return ret;
+	ret = apple_sftl_snapshot(sftl, 65536, &snapshot);
+	apple_sftl_free(sftl);
+	if (ret)
+		return ret;
+	map = *snapshot;
+	map.nr_opaque = 32;
+	map.opaque = kvzalloc(array_size(map.nr_opaque, sizeof(*map.opaque)), GFP_KERNEL);
+	if (!map.opaque) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	apple_sftl_test_native_prefix(map.opaque);
+	map.opaque[8].data[8 * blocks[0]] = 7;
+	map.opaque[8].data[8 * blocks[1]] = 7;
+	map.opaque[8].data[8 * 5] = 3;
+	map.opaque[8].data[8 * 5 + 1] = 64;
+	map.opaque[8].data[8 * 6] = 1;
+	put_unaligned_le32(9, map.opaque[28].data + 5 * sizeof(u32));
+	ret = apple_sftl_checkpoint_build(&map, blocks, 2, 96, &image);
+	kvfree(map.opaque);
+	if (ret)
+		goto out;
+	if (image->count != 96) {
+		apple_sftl_checkpoint_free(image);
+		ret = -EINVAL;
+		goto out;
+	}
+	apple_sftl_checkpoint_free(f->checkpoint);
+	f->checkpoint = image;
+	f->show_staged = true;
+out:
+	apple_sftl_snapshot_free(snapshot);
+	return ret;
+}
+
+static int sftl_test_native_medium(struct sftl_fixture *f, u8 *data)
+{
+	int ret = sftl_test_gc_live_medium(f, data);
+
+	return ret ? ret : sftl_test_native_context(f);
+}
+
+/* Only this synthetic medium authorizes the remaining stream/role state. */
+static int sftl_test_prepare_native(void *priv, struct apple_sftl_context_record *records,
+				    u32 count, const struct apple_sftl_snapshot *map,
+				    u32 victim, u32 landing, const u32 blocks[2])
+{
+	struct sftl_fixture *f = priv;
+
+	f->native_policy_calls++;
+	if (count != 32 || !map->nr_runs || records[0].meta[1] != 1 ||
+	    blocks[0] != 7 || blocks[1] != 1 || victim != 5 || landing != 6)
+		return -EINVAL;
+	if (records[8].data[8 * victim] != 3 || records[8].data[8 * landing] != 1)
+		return -EINVAL;
+	if (f->drop_context_role)
+		records[8].data[8 * blocks[1]] = 9;
+	if (!f->keep_donor_role)
+		records[8].data[8 * victim] = 9;
+	put_unaligned_le32(0, records[28].data + victim * sizeof(u32));
+	records[8].data[8 * landing] = 4;
+	if (f->duplicate_stream)
+		records[8].data[8 * 4] = 4;
+	return f->native_policy_error;
+}
+
+static const struct apple_sftl_checkpoint_ops sftl_test_native_ops = {
+	.prepare_native = sftl_test_prepare_native,
+};
+
+static int sftl_test_native_erase(void *priv, unsigned int bus, unsigned int cau, unsigned int block)
+{
+	struct sftl_fixture *f = priv;
+
+	f->erases++;
+	if (f->erases == f->native_erase_cut)
+		return -EIO;
+	if (cau || bus > 1)
+		return -EPERM;
+	if (block == 1 && f->loaded_before_retirement && !(f->erased_context_lanes & (1U << bus))) {
+		f->erased_context_lanes |= 1U << bus;
+		return 0;
+	}
+	if (block != 5 || bus || f->erased_context_lanes != 3 || !f->loaded_after_retirement)
+		return -EPERM;
+	memset(f->written[0], 0, 128 * sizeof(*f->written[0]));
+	return 0;
+}
+
+static void sftl_test_gc_native_publication(struct kunit *test)
+{
+	struct apple_sftl_info info;
+	unsigned int cut;
+
+	for (cut = 0; cut <= 3; cut++) {
+		struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+		u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+		struct apple_sftl *sftl = NULL;
+		u64 newest;
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		KUNIT_ASSERT_NOT_NULL(test, data);
+		KUNIT_ASSERT_EQ(test, sftl_test_native_medium(f, data), 0);
+		newest = f->checkpoint->sequence + 8 + 96;
+		f->ops.erase_block = sftl_test_native_erase;
+		f->native_erase_cut = cut;
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		apple_sftl_set_checkpoint_ops(sftl, &sftl_test_native_ops, f);
+		memset(data, 'W', APPLE_SFTL_CHUNK);
+		ret = apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1);
+		KUNIT_EXPECT_EQ(test, ret, cut ? -EIO : 0);
+		KUNIT_EXPECT_EQ(test, f->native_policy_calls, 1U);
+		KUNIT_EXPECT_EQ(test, f->erases, cut ? cut : 3U);
+		KUNIT_EXPECT_EQ(test, f->erased_context_lanes, cut == 1 ? 0 : (cut == 2 ? 1 : 3));
+		KUNIT_EXPECT_EQ(test, f->loaded_before_retirement, true);
+		KUNIT_EXPECT_EQ(test, f->loaded_after_retirement, !cut || cut == 3);
+		if (cut)
+			KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1), -EIO);
+		apple_sftl_free(sftl);
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		apple_sftl_get_info(sftl, &info);
+		KUNIT_EXPECT_EQ(test, info.checkpoint_sequence, newest);
+		KUNIT_EXPECT_EQ(test, info.sequence, cut ? newest : newest + 4);
+		sftl_test_gc_relocated_data(test, sftl, data, cut ? 0 : 'W');
+		if (cut == 2) {
+			KUNIT_EXPECT_EQ(test, info.read_only, true);
+			KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1),
+					-EROFS);
+		}
+		if (cut)
+			KUNIT_ASSERT_NOT_NULL(test, sftl_test_written(f, 0, 0, 0));
+		else
+			KUNIT_EXPECT_PTR_EQ(test, sftl_test_written(f, 0, 0, 0), NULL);
+		KUNIT_EXPECT_EQ(test, f->erases, cut ? cut : 3U);
+		apple_sftl_free(sftl);
+		if (cut == 2) {
+			/* Residual data on the old lane must predate the new generation.
+			 * A newer tag among its surviving records cannot be discarded.
+			 */
+			u8 *meta = f->checkpoint->records[4].meta;
+
+			put_unaligned_le64((newest + 1) << 16 | 0x021f, meta);
+			KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+			KUNIT_EXPECT_PTR_EQ(test, sftl, NULL);
+			apple_sftl_free(sftl);
+		}
+		apple_sftl_checkpoint_free(f->checkpoint);
+	}
+}
+
+static void sftl_test_gc_native_prefix_cuts(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	struct sftl_test_page *saved[24];
+	struct apple_sftl *sftl = NULL;
+	struct apple_sftl_info info;
+	unsigned int cut, programs;
+	u64 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, sftl_test_native_medium(f, data), 0);
+	f->ops.erase_block = sftl_test_native_erase;
+	f->native_erase_cut = 1;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_set_checkpoint_ops(sftl, &sftl_test_native_ops, f);
+	KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1), -EIO);
+	apple_sftl_free(sftl);
+	KUNIT_ASSERT_NOT_NULL(test, sftl_test_written(f, 2, 0, 23));
+	memcpy(saved, f->written[2], sizeof(saved));
+	first = f->checkpoint->sequence + 9;
+	programs = f->programs;
+	for (cut = 0; cut <= ARRAY_SIZE(saved); cut++) {
+		memcpy(f->written[2], saved, cut * sizeof(*saved));
+		memset(f->written[2] + cut, 0, (ARRAY_SIZE(saved) - cut) * sizeof(*saved));
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		apple_sftl_get_info(sftl, &info);
+		KUNIT_EXPECT_EQ(test, info.checkpoint_sequence,
+				cut == 24 ? first + 95 : f->checkpoint->sequence);
+		KUNIT_EXPECT_EQ(test, info.sequence, first - 1 + cut * 4);
+		if (cut && cut < 24) {
+			KUNIT_EXPECT_EQ(test, info.read_only, true);
+			KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1), -EROFS);
+		}
+		sftl_test_gc_relocated_data(test, sftl, data, 0);
+		KUNIT_EXPECT_EQ(test, f->programs, programs);
+		KUNIT_EXPECT_EQ(test, f->erases, 1U);
+		apple_sftl_free(sftl);
+	}
+	apple_sftl_checkpoint_free(f->checkpoint);
+}
+
+static void sftl_test_gc_native_policy_refuses(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	struct apple_sftl *sftl = NULL;
+	unsigned int programs;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, sftl_test_native_medium(f, data), 0);
+	f->ops.erase_block = sftl_test_native_erase;
+	f->native_policy_error = -EAGAIN;
+	programs = f->programs;
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	apple_sftl_set_checkpoint_ops(sftl, &sftl_test_native_ops, f);
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, f->native_policy_calls, 1U);
+	f->native_policy_error = 0;
+	f->drop_context_role = true;
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1), -EBADMSG);
+	KUNIT_EXPECT_EQ(test, f->native_policy_calls, 2U);
+	f->drop_context_role = false;
+	f->keep_donor_role = true;
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1), -EBADMSG);
+	f->keep_donor_role = false;
+	f->duplicate_stream = true;
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1), -EBADMSG);
+	KUNIT_EXPECT_EQ(test, f->native_policy_calls, 4U);
+	KUNIT_EXPECT_EQ(test, f->programs, programs);
+	KUNIT_EXPECT_EQ(test, f->erases, 0U);
+	sftl_test_gc_relocated_data(test, sftl, data, 0);
+	apple_sftl_free(sftl);
+	apple_sftl_checkpoint_free(f->checkpoint);
+}
+
+/* An unnamed context or reserved spare has the same erased bytes as a free
+ * landing block. Its saved role still owns it, even in append-only mode.
+ */
+static void sftl_test_native_blank_ownership(struct kunit *test)
+{
+	static const struct { u8 role; u16 live; } cases[] = {
+		{ 7, 0 }, { 8, 0 }, { 0xff, 0 }, { 4, 0 }, { 9, 0 }, { 2, 0 }, { 1, 1 },
+	};
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	struct apple_sftl *sftl = NULL;
+	unsigned int programs, i;
+	u8 *entry;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, sftl_test_native_medium(f, data), 0);
+	programs = f->programs;
+	entry = f->checkpoint->records[8].data + 6 * 8;
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		entry[0] = cases[i].role;
+		put_unaligned_le16(cases[i].live, entry + 2);
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1),
+				-ENOSPC);
+		KUNIT_EXPECT_EQ(test, f->programs, programs);
+		KUNIT_EXPECT_EQ(test, f->erases, 0U);
+		apple_sftl_free(sftl);
+	}
+	entry[0] = 1;
+	put_unaligned_le16(0, entry + 2);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 5, data, 1), 0);
+	KUNIT_EXPECT_EQ(test, f->programs, programs + 1);
+	KUNIT_EXPECT_EQ(test, f->erases, 0U);
+	apple_sftl_free(sftl);
+	apple_sftl_checkpoint_free(f->checkpoint);
+}
+
+static int sftl_test_erase_native_free(void *priv, unsigned int bus, unsigned int cau,
+				       unsigned int block)
+{
+	struct sftl_fixture *f = priv;
+
+	f->erases++;
+	if (bus || cau || block != 5 || !f->written[0])
+		return -EPERM;
+	memset(f->written[0], 0, 128 * sizeof(*f->written[0]));
+	return 0;
+}
+
+/* Both recovered maps have released the old ordinary data. Direct erase
+ * still requires the native checkpoint to have retired its ownership.
+ */
+static void sftl_test_native_retired_ownership(struct kunit *test)
+{
+	static const struct { u8 role, flags; u16 live; } cases[] = {
+		{ 3, 64, 0 }, { 3, 64, 1 }, { 7, 64, 0 }, { 8, 64, 0 },
+		{ 9, 8, 0 }, { 9, 64, 1 },
+	};
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	struct apple_sftl *sftl = NULL;
+	unsigned int programs, i;
+	u8 *entry;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	f->checkpoint_slot = true;
+	KUNIT_ASSERT_EQ(test, sftl_test_gc_medium(f, data, GC_CHECKPOINT_AFTER_OVERWRITE), 0);
+	KUNIT_ASSERT_EQ(test, sftl_test_native_context(f), 0);
+	f->ops.erase_block = sftl_test_erase_native_free;
+	programs = f->programs;
+	entry = f->checkpoint->records[8].data + 5 * 8;
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		entry[0] = cases[i].role;
+		entry[1] = cases[i].flags;
+		put_unaligned_le16(cases[i].live, entry + 2);
+		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+		KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 480, data, 1),
+				-ENOSPC);
+		KUNIT_EXPECT_EQ(test, f->programs, programs);
+		KUNIT_EXPECT_EQ(test, f->erases, 0U);
+		apple_sftl_free(sftl);
+	}
+	entry[0] = 9;
+	entry[1] = 64;
+	put_unaligned_le16(0, entry + 2);
+	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
+	KUNIT_EXPECT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 480, data, 1), 0);
+	KUNIT_EXPECT_EQ(test, f->programs, programs + 1);
+	KUNIT_EXPECT_EQ(test, f->erases, 1U);
+	apple_sftl_free(sftl);
+	apple_sftl_checkpoint_free(f->checkpoint);
+}
+
 static void sftl_test_gc_retries_reservation(struct kunit *test)
 {
 	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
@@ -1516,6 +2373,7 @@ static void sftl_test_gc_relocates_on_write(struct kunit *test)
 {
 	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
 	struct apple_sftl *sftl = NULL, *cold = NULL;
+	struct apple_sftl_snapshot *before, *after;
 	u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
 	struct sftl_test_page *page, *copy;
 	u8 saved[APPLE_PPN_OOB_SIZE];
@@ -1523,7 +2381,18 @@ static void sftl_test_gc_relocates_on_write(struct kunit *test)
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	KUNIT_ASSERT_NOT_NULL(test, data);
+	f->sequence_bias = 0x20000ULL - (TEST_APPEND_FIRST + 479 + 4 + 6);
 	KUNIT_ASSERT_EQ(test, sftl_test_gc_live_medium(f, data), 0);
+	/* The five live donor chunks already came from a previous user epoch. */
+	page = sftl_test_written(f, 0, 0, 120);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	KUNIT_ASSERT_EQ(test, get_unaligned_le32(page->data + 475 * 16 + 12), 5U);
+	put_unaligned_le32(0, page->data + 475 * 16 + 4);
+	for (i = 475; i < 480; i++) {
+		page = sftl_test_written(f, 0, 0, i / 4);
+		KUNIT_ASSERT_NOT_NULL(test, page);
+		put_unaligned_le32(0, page->oob + i % 4 * 16 + 12);
+	}
 	f->ops.erase_block = sftl_test_erase_block;
 	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
 	apple_sftl_set_checkpoint_ops(sftl, &sftl_test_gc_ops, f);
@@ -1539,6 +2408,9 @@ static void sftl_test_gc_relocates_on_write(struct kunit *test)
 		KUNIT_ASSERT_NOT_NULL(test, page);
 		KUNIT_EXPECT_EQ(test, get_unaligned_le32(page->oob + (slot % 4) * 16 + 8),
 				TEST_APPEND_BASE + i);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(page->oob + (slot % 4) * 16 + 12), 0U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(page->oob + (slot % 4) * 16 + 4),
+				i < 2 ? 1U : 2U);
 		sftl_test_expect_fill(test, page->data + slot % 4 * 4096, 119 + i);
 	}
 	page = sftl_test_written(f, 1, 0, 2);
@@ -1553,6 +2425,18 @@ static void sftl_test_gc_relocates_on_write(struct kunit *test)
 	memset(data, 'Z', APPLE_PPN_PAGE_SIZE);
 	for (i = 3; i < TEST_APPEND_PROGRAMS; i++)
 		KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 4 * i, data, 4), 0);
+	/* All five sequential keys share one historical age across the weave carry. */
+	page = sftl_test_written(f, 1, 0, 120);
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(page->data + 3 * 16), 3U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(page->data + 3 * 16 + 4), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(page->data + 3 * 16 + 8), TEST_APPEND_BASE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(page->data + 3 * 16 + 12), 5U);
+	KUNIT_ASSERT_EQ(test, get_unaligned_le32(page->data + 4 * 16 + 4), 2U);
+	put_unaligned_le32(3, page->data + 4 * 16 + 4);
+	KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &cold), -EBADMSG);
+	apple_sftl_free(cold);
+	put_unaligned_le32(2, page->data + 4 * 16 + 4);
 	page = sftl_test_written(f, 1, 0, 127);
 	KUNIT_ASSERT_NOT_NULL(test, page);
 	KUNIT_EXPECT_EQ(test, page->oob[0], (u8)0x1c);
@@ -1580,8 +2464,14 @@ static void sftl_test_gc_relocates_on_write(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, apple_sftl_write(sftl, TEST_APPEND_BASE + 480, data, 1), 0);
 	KUNIT_ASSERT_NOT_NULL(test, sftl_test_written(f, 0, 0, 0));
 	KUNIT_EXPECT_EQ(test, f->erases, 1U);
+	KUNIT_ASSERT_EQ(test, apple_sftl_snapshot(sftl, 65536, &before), 0);
 	apple_sftl_free(sftl);
 	KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &cold), 0);
+	KUNIT_ASSERT_EQ(test, apple_sftl_snapshot(cold, 65536, &after), 0);
+	KUNIT_ASSERT_EQ(test, after->nr_runs, before->nr_runs);
+	KUNIT_EXPECT_MEMEQ(test, after->runs, before->runs, before->nr_runs * sizeof(*before->runs));
+	apple_sftl_snapshot_free(after);
+	apple_sftl_snapshot_free(before);
 	sftl_test_gc_relocated_data(test, cold, data, 'W');
 	KUNIT_ASSERT_EQ(test, apple_sftl_read(cold, TEST_APPEND_BASE + 480, data), 0);
 	sftl_test_expect_fill(test, data, 'Z');
@@ -1610,6 +2500,8 @@ static void sftl_test_gc_relocation_stops_before_erase(struct kunit *test)
 
 		KUNIT_ASSERT_NOT_NULL(test, f);
 		KUNIT_ASSERT_NOT_NULL(test, data);
+		/* Cold recovery must replay historical ages under the old checkpoint. */
+		f->sequence_bias = 0x20000ULL - (TEST_APPEND_FIRST + 479 + 4 + 6);
 		KUNIT_ASSERT_EQ(test, sftl_test_gc_live_medium(f, data), 0);
 		f->ops.erase_block = sftl_test_erase_block;
 		f->commit = modes[mode].commit;
@@ -1633,6 +2525,14 @@ static void sftl_test_gc_relocation_stops_before_erase(struct kunit *test)
 		KUNIT_ASSERT_EQ(test, apple_sftl_load(&f->provider, &sftl), 0);
 		sftl_test_gc_relocated_data(test, sftl, data, 0);
 		apple_sftl_free(sftl);
+		if (modes[mode].copy_error) {
+			struct sftl_test_page *page = sftl_test_written(f, 1, 0, 1);
+
+			KUNIT_ASSERT_NOT_NULL(test, page);
+			put_unaligned_le32(3, page->oob + 12);
+			KUNIT_EXPECT_EQ(test, apple_sftl_load(&f->provider, &sftl), -EBADMSG);
+			apple_sftl_free(sftl);
+		}
 		apple_sftl_checkpoint_free(f->checkpoint);
 	}
 }
@@ -1673,6 +2573,14 @@ static void sftl_test_gc_preserves_last_sequences(struct kunit *test)
 }
 
 static struct kunit_case apple_sftl_cases[] = {
+	KUNIT_CASE(sftl_test_rotate_mounted),
+	KUNIT_CASE(sftl_test_vfl_rotation_cuts),
+	KUNIT_CASE(sftl_test_vfl_rejects_ambiguous_tables),
+	KUNIT_CASE(sftl_test_native_blank_ownership),
+	KUNIT_CASE(sftl_test_native_retired_ownership),
+	KUNIT_CASE(sftl_test_gc_native_publication),
+	KUNIT_CASE(sftl_test_gc_native_prefix_cuts),
+	KUNIT_CASE(sftl_test_gc_native_policy_refuses),
 	KUNIT_CASE(sftl_test_gc_retries_reservation),
 	KUNIT_CASE(sftl_test_gc_preserves_last_sequences),
 	KUNIT_CASE(sftl_test_gc_relocates_on_write),
@@ -1697,6 +2605,12 @@ static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_append_rejects_invalid_window),
 	KUNIT_CASE(sftl_test_complete_medium),
 	KUNIT_CASE(sftl_test_checkpoint_cold_roundtrip),
+	KUNIT_CASE(sftl_test_context_power_cuts),
+	KUNIT_CASE(sftl_test_context_stage_failures),
+	KUNIT_CASE(sftl_test_checkpoint_stage_protects_tail),
+	KUNIT_CASE(sftl_test_context_pins_fallback_blocks),
+	KUNIT_CASE(sftl_test_context_torn_append_replay),
+	KUNIT_CASE(sftl_test_reject_corrupt_generation),
 	KUNIT_CASE(sftl_test_scan_after_open_lane_hole),
 	KUNIT_CASE(sftl_test_runtime_failure_stops_reads),
 	KUNIT_CASE(sftl_test_reject_incomplete_or_ambiguous),

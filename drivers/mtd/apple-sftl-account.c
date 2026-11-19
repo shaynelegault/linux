@@ -103,20 +103,19 @@ static u8 *sftl_sb_entry(struct apple_sftl_context_record *records, u32 block)
 	return records[record].data + offset;
 }
 
-bool apple_sftl_account_context_pair(const struct apple_sftl_snapshot *snapshot,
-				    const u32 blocks[2])
+static bool sftl_account_context_pair(struct apple_sftl_context_record *records, u32 count,
+				      const u32 blocks[2])
 {
 	u32 i;
 
-	if (!snapshot || snapshot->nr_opaque != APPLE_SFTL_ACCOUNT_RECORDS || !blocks ||
-	    blocks[0] == blocks[1] || !sftl_native_prefix(snapshot->opaque, snapshot->nr_opaque))
+	if (!blocks || blocks[0] == blocks[1] || !sftl_native_prefix(records, count))
 		return false;
 	for (i = 0; i < 2; i++) {
 		const u8 *entry;
 
 		if (!blocks[i] || blocks[i] >= APPLE_SFTL_SUBBLOCKS)
 			return false;
-		entry = sftl_sb_entry(snapshot->opaque, blocks[i]);
+		entry = sftl_sb_entry(records, blocks[i]);
 		/* Recovery assigns class 7 to context (0x1f) at 0x8108d762.
 		 * The context allocator independently assigns it at 0x810937a4.
 		 */
@@ -125,7 +124,53 @@ bool apple_sftl_account_context_pair(const struct apple_sftl_snapshot *snapshot,
 	}
 	return true;
 }
+
+bool apple_sftl_account_context_pair(const struct apple_sftl_snapshot *snapshot,
+				    const u32 blocks[2])
+{
+	return snapshot && snapshot->nr_opaque == APPLE_SFTL_ACCOUNT_RECORDS &&
+		sftl_account_context_pair(snapshot->opaque, snapshot->nr_opaque, blocks);
+}
 EXPORT_SYMBOL_GPL(apple_sftl_account_context_pair);
+
+/* The next generation is saved after verified ordinary copies, before source
+ * erase and before the caller's next write. Source footer reads have already
+ * established its width. This writer emits the ordinary (stream zero) tags.
+ */
+bool apple_sftl_account_gc_image(const struct apple_sftl_snapshot *before,
+				 const struct apple_sftl_checkpoint *image, const u32 blocks[2],
+				 u32 donor, u32 landing, u32 live, u16 footer_chunks)
+{
+	u32 block, seen = 0, reads_per_record = APPLE_SFTL_CHUNK / sizeof(u32);
+	const u8 *old_source, *source, *destination, *reads;
+
+	if (image->count <= APPLE_SFTL_ACCOUNT_RECORDS ||
+	    !sftl_account_context_pair(image->records, image->count, blocks) ||
+	    !donor || donor >= APPLE_SFTL_SUBBLOCKS || !landing || landing >= APPLE_SFTL_SUBBLOCKS ||
+	    !live || footer_chunks < 4 || footer_chunks > 32 || footer_chunks % 4)
+		return false;
+	old_source = sftl_sb_entry(before->opaque, donor);
+	source = sftl_sb_entry(image->records, donor);
+	destination = sftl_sb_entry(image->records, landing);
+	reads = image->records[SFTL_READ_COUNT_START + donor / reads_per_record].data +
+		(donor % reads_per_record) * sizeof(u32);
+	if (old_source[0] != 3 || source[0] != 9 || source[1] != old_source[1] ||
+	    source[1] >> 1 != footer_chunks ||
+	    get_unaligned_le16(source + 6) != get_unaligned_le16(old_source + 6) ||
+	    get_unaligned_le16(source + 2) || get_unaligned_le32(reads) ||
+	    destination[0] != 4 || destination[1] || get_unaligned_le16(destination + 2) != live)
+		return false;
+	for (block = 0; block < APPLE_SFTL_SUBBLOCKS; block++) {
+		const u8 *entry = sftl_sb_entry(image->records, block);
+
+		if (entry[0] != 4)
+			continue;
+		if (entry[1] > 1 || (seen & (1U << entry[1])))
+			return false;
+		seen |= 1U << entry[1];
+	}
+	return true;
+}
 
 int apple_sftl_account_user_seq(struct apple_sftl_snapshot *snapshot,
 				const struct apple_sftl_user_seq *updates)

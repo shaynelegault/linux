@@ -206,9 +206,11 @@ static int sftl_disk_probe(struct platform_device *pdev)
 		goto free_ftl;
 	}
 	/* Appending continues the journal; it must end where the map does. */
-	sftl->writable = provider->ops->program_page &&
+	sftl->writable = provider->ops->program_page && !info.read_only &&
 			 info.sequence == info.journal_sequence;
-	if (provider->ops->program_page && !sftl->writable)
+	if (info.read_only)
+		dev_warn(&pdev->dev, "incomplete metadata publication, read-only\n");
+	else if (provider->ops->program_page && !sftl->writable)
 		dev_warn(&pdev->dev, "journal ends before the allocation floor, read-only\n");
 	if (sftl->writable)
 		limits.features |= BLK_FEAT_FUA;

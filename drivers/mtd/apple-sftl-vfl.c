@@ -235,14 +235,18 @@ static int vfl_program(struct vfl_rotation *r, unsigned int page, struct vfl_pag
 	return 0;
 }
 
-int apple_sftl_vfl_rotate(struct apple_ppn *ppn, const struct apple_sftl_vfl_source *s,
-			  const struct apple_sftl_vfl_ops *ops, void *priv)
+int apple_sftl_vfl_rotate_checked(struct apple_ppn *ppn, const struct apple_sftl_vfl_source *s,
+				  const struct apple_sftl_vfl_ops *ops, void *priv,
+				  bool *started)
 {
 	struct vfl_rotation *r;
 	u32 age;
 	unsigned int lane;
 	int ret;
 
+	if (!started)
+		return -EINVAL;
+	*started = false;
 	if (!ppn || !ppn->ops || !ppn->ops->read_page || !s ||
 	    !ops || !ops->erase || !ops->program)
 		return -EOPNOTSUPP;
@@ -262,8 +266,10 @@ int apple_sftl_vfl_rotate(struct apple_ppn *ppn, const struct apple_sftl_vfl_sou
 	ret = vfl_source_pages(r);
 	if (!ret)
 		ret = vfl_check_target(r);
-	if (!ret)
+	if (!ret) {
+		*started = true;
 		ret = vfl_erase_target(r);
+	}
 	if (!ret)
 		ret = vfl_program(r, 0, &r->checkpoint, VFL_GLOBAL, age);
 	for (lane = 0; !ret && lane < VFL_LANES; lane++) {
@@ -278,5 +284,13 @@ int apple_sftl_vfl_rotate(struct apple_ppn *ppn, const struct apple_sftl_vfl_sou
 				  VFL_GLOBAL, age - VFL_LANES - 1);
 	kvfree(r);
 	return ret;
+}
+
+int apple_sftl_vfl_rotate(struct apple_ppn *ppn, const struct apple_sftl_vfl_source *s,
+			  const struct apple_sftl_vfl_ops *ops, void *priv)
+{
+	bool started;
+
+	return apple_sftl_vfl_rotate_checked(ppn, s, ops, priv, &started);
 }
 EXPORT_SYMBOL_GPL(apple_sftl_vfl_rotate);

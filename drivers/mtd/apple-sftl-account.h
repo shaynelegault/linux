@@ -15,6 +15,9 @@ struct apple_sftl_checkpoint;
 struct apple_sftl_snapshot;
 
 bool apple_sftl_account_context_pair(const struct apple_sftl_snapshot *snapshot, const u32 blocks[2]);
+bool apple_sftl_account_gc_image(const struct apple_sftl_snapshot *before,
+				 const struct apple_sftl_checkpoint *image, const u32 blocks[2],
+				 u32 donor, u32 landing, u32 live, u16 footer_chunks);
 /* Donor component of a post-GC state. The caller has validated its footer,
  * removed its final mapping and knows the counters represent the baseline
  * immediately before this retirement. A native save can precede stats refresh.
