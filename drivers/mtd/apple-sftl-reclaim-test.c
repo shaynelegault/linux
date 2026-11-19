@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Synthetic checkpoints and supplied IO receipts; no media mutations. */
+/* Checkpoint and reclamation tests on synthetic flash. */
 #include <kunit/test.h>
 #include <linux/errno.h>
 #include <linux/slab.h>
@@ -121,14 +121,14 @@ static void reclaim_gc_transaction(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, copy);
 	KUNIT_EXPECT_EQ(test, copy->logical, 0U);
 	KUNIT_EXPECT_EQ(test, copy->length, 2U);
-	KUNIT_EXPECT_EQ(test, copy->destination, 7 * APPLE_SFTL_STRIDE);
-	KUNIT_ASSERT_EQ(test, apple_sftl_gc_copy_done(gc, copy, 202), 0);
+	KUNIT_EXPECT_EQ(test, copy->destination, 7 * APPLE_SFTL_STRIDE + 2);
+	KUNIT_ASSERT_EQ(test, apple_sftl_gc_copy_done(gc, copy, 204), 0);
 	KUNIT_EXPECT_EQ(test, apple_sftl_gc_stage(gc), APPLE_SFTL_GC_CHECKPOINT);
 	KUNIT_ASSERT_EQ(test, apple_sftl_gc_checkpoint(gc, blocks, 1, &image), 0);
 	KUNIT_ASSERT_EQ(test, apple_sftl_gc_checkpoint_done(gc, image), 0);
 	KUNIT_EXPECT_EQ(test, apple_sftl_gc_stage(gc), APPLE_SFTL_GC_RECOVERY);
 	memcpy(recovered_runs, runs, sizeof(runs));
-	recovered_runs[0].provider = 7 * APPLE_SFTL_STRIDE;
+	recovered_runs[0].provider = 7 * APPLE_SFTL_STRIDE + 2;
 	recovered = snapshot;
 	recovered.runs = recovered_runs;
 	recovered.sequence = image->sequence;
@@ -306,9 +306,153 @@ static void reclaim_gc_boundaries(struct kunit *test)
 	ret = apple_sftl_gc_plan(&snapshot, &victim, &destination, 4, 65536, &gc);
 	KUNIT_EXPECT_EQ(test, ret, -EBADMSG);
 	KUNIT_EXPECT_PTR_EQ(test, gc, NULL);
+	/* A short native footer leaves extra source chunks available for data. */
+	runs[0].provider = victim.block * APPLE_SFTL_STRIDE + 1024 - 5;
+	victim.footer_chunks = 4;
+	KUNIT_ASSERT_EQ(test, apple_sftl_gc_plan(&snapshot, &victim, &destination,
+						 4, 65536, &gc), 0);
+	apple_sftl_gc_free(gc);
+	runs[0].provider++;
+	KUNIT_EXPECT_EQ(test, apple_sftl_gc_plan(&snapshot, &victim, &destination,
+						 4, 65536, &gc), -EBADMSG);
+	victim.footer_chunks = 5;
+	KUNIT_EXPECT_EQ(test, apple_sftl_gc_plan(&snapshot, &victim, &destination,
+						 4, 65536, &gc), -EINVAL);
+}
+
+enum copy_fault {
+	COPY_GOOD, COPY_BAD_KEY, COPY_FLAGGED, COPY_KIND2, COPY_ZERO_STAMP,
+	COPY_BUSY, COPY_PROGRAM_ERROR,
+	COPY_DATA_MISMATCH, COPY_OOB_MISMATCH,
+};
+
+struct copy_medium {
+	struct apple_sftl_gc_page pages[2];
+	enum copy_fault fault;
+	unsigned int programs;
+};
+
+static int copy_read(void *priv, u32 addr, struct apple_sftl_gc_page *page)
+{
+	struct copy_medium *m = priv;
+	unsigned int i;
+
+	if (addr == 4 * APPLE_SFTL_STRIDE || addr == 4 * APPLE_SFTL_STRIDE + 4) {
+		for (i = 0; i < 4; i++) {
+			u8 *meta = page->oob + i * APPLE_SFTL_META;
+			u32 chunk = addr % APPLE_SFTL_STRIDE + i;
+
+			memset(page->data + i * APPLE_SFTL_CHUNK, chunk, APPLE_SFTL_CHUNK);
+			put_unaligned_le64((m->fault == COPY_ZERO_STAMP ? 0ULL : 80ULL + chunk) << 16, meta);
+			meta[0] = m->fault == COPY_KIND2 ? 2 : 1;
+			meta[1] = m->fault == COPY_FLAGGED;
+			put_unaligned_le32(m->fault == COPY_BAD_KEY ? 99 : chunk - 1, meta + 8);
+			put_unaligned_le32(0, meta + 12);
+		}
+		return 0;
+	}
+	if (addr != 7 * APPLE_SFTL_STRIDE && addr != 7 * APPLE_SFTL_STRIDE + 4)
+		return -ERANGE;
+	i = (addr % APPLE_SFTL_STRIDE) / 4;
+	memcpy(page, &m->pages[i], sizeof(*page));
+	if (i == 1 && m->programs == 2) {
+		if (m->fault == COPY_DATA_MISMATCH)
+			page->data[0] ^= 1;
+		if (m->fault == COPY_OOB_MISMATCH)
+			page->oob[63] ^= 1;
+	}
+	return 0;
+}
+
+static int copy_program(void *priv, u32 addr, const struct apple_sftl_gc_page *page)
+{
+	struct copy_medium *m = priv;
+	unsigned int i = m->programs;
+
+	if (i >= 2 || addr != 7 * APPLE_SFTL_STRIDE + 4 * i)
+		return -EINVAL;
+	memcpy(&m->pages[i], page, sizeof(*page));
+	m->programs++;
+	return i && m->fault == COPY_PROGRAM_ERROR ? -EIO : 0;
+}
+
+static void reclaim_copy_live_pages(struct kunit *test)
+{
+	static const struct apple_sftl_gc_io io = { .read = copy_read, .program = copy_program };
+	static const u32 keys[] = { 0, 0, 0, 0, 1, 2, 4, 5 };
+	const u32 dest = 7 * APPLE_SFTL_STRIDE;
+	struct apple_sftl_context_record *opaque = kunit_kmalloc(test, sizeof(*opaque), GFP_KERNEL);
+	struct copy_medium *m = kunit_kmalloc(test, sizeof(*m), GFP_KERNEL);
+	struct apple_sftl_extent runs[4], relocated[4];
+	struct apple_sftl_snapshot snapshot, recovered;
+	struct apple_sftl_gc_block victim = {
+		.block = 4, .lanes = 3, .closed = true, .last_sequence = 199,
+	};
+	struct apple_sftl_gc_block destination = { .block = 7, .lanes = 3, .blank = true };
+	u32 context_block = 5;
+	unsigned int fault, i;
+
+	KUNIT_ASSERT_NOT_NULL(test, opaque);
+	KUNIT_ASSERT_NOT_NULL(test, m);
+	reclaim_source(&snapshot, opaque, runs, 4);
+	runs[0] = (struct apple_sftl_extent) { 0, 3, 4 * APPLE_SFTL_STRIDE + 1 };
+	runs[1] = (struct apple_sftl_extent) { 3, 1, 6 * APPLE_SFTL_STRIDE };
+	runs[2] = (struct apple_sftl_extent) { 4, 2, 4 * APPLE_SFTL_STRIDE + 5 };
+	runs[3] = (struct apple_sftl_extent) {
+		6, APPLE_SFTL_LOGICAL_PAGES - 6, APPLE_SFTL_NO_ADDRESS,
+	};
+	for (fault = COPY_GOOD; fault <= COPY_OOB_MISMATCH; fault++) {
+		struct apple_sftl_gc *gc;
+		struct apple_sftl_checkpoint *image;
+		int ret;
+
+		memset(m->pages, 0xff, sizeof(m->pages));
+		m->fault = fault;
+		m->programs = 0;
+		if (fault == COPY_BUSY)
+			m->pages[0].oob[63] = 0;
+		KUNIT_ASSERT_EQ(test, apple_sftl_gc_plan(&snapshot, &victim, &destination,
+							 4, 65536, &gc), 0);
+		ret = apple_sftl_gc_relocate(gc, &io, m);
+		if (fault != COPY_GOOD) {
+			KUNIT_EXPECT_EQ(test, ret, fault == COPY_PROGRAM_ERROR ? -EIO : -EBADMSG);
+			KUNIT_EXPECT_EQ(test, apple_sftl_gc_stage(gc), APPLE_SFTL_GC_FAILED);
+			KUNIT_EXPECT_EQ(test, m->programs,
+					fault <= COPY_BUSY ? 0U : 2U);
+			KUNIT_EXPECT_EQ(test, apple_sftl_gc_relocate(gc, &io, m), -EINVAL);
+			apple_sftl_gc_free(gc);
+			continue;
+		}
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_EXPECT_EQ(test, m->programs, 2U);
+		for (i = 0; i < ARRAY_SIZE(keys); i++) {
+			const u8 *meta = &m->pages[i / 4].oob[(i % 4) * APPLE_SFTL_META];
+			const u8 *data = &m->pages[i / 4].data[(i % 4) * APPLE_SFTL_CHUNK];
+
+			KUNIT_EXPECT_EQ(test, get_unaligned_le64(meta) >> 16, 201ULL + i);
+			KUNIT_EXPECT_EQ(test, get_unaligned_le32(meta + 8), keys[i]);
+			KUNIT_EXPECT_EQ(test, data[0], (u8)(keys[i] + 1));
+			KUNIT_EXPECT_EQ(test, data[APPLE_SFTL_CHUNK - 1], data[0]);
+		}
+		KUNIT_ASSERT_EQ(test, apple_sftl_gc_checkpoint(gc, &context_block, 1, &image), 0);
+		KUNIT_EXPECT_EQ(test, image->first_sequence, 209ULL);
+		KUNIT_ASSERT_EQ(test, apple_sftl_gc_checkpoint_done(gc, image), 0);
+		memcpy(relocated, runs, sizeof(runs));
+		relocated[0].provider = dest + 3;
+		relocated[2].provider = dest + 6;
+		recovered = snapshot;
+		recovered.runs = relocated;
+		recovered.sequence = image->sequence;
+		recovered.journal_sequence = image->sequence;
+		recovered.checkpoint_sequence = image->sequence;
+		KUNIT_EXPECT_EQ(test, apple_sftl_gc_recovered(gc, &recovered), 0);
+		apple_sftl_checkpoint_free(image);
+		apple_sftl_gc_free(gc);
+	}
 }
 
 static struct kunit_case reclaim_cases[] = {
+	KUNIT_CASE(reclaim_copy_live_pages),
 	KUNIT_CASE(reclaim_metadata_vector),
 	KUNIT_CASE(reclaim_checkpoint_opaque_and_invalid),
 	KUNIT_CASE(reclaim_checkpoint_torn_receipts),

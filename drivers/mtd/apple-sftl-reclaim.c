@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * SwissPPNFTL checkpoint serialization and offline reclamation transactions.
+ * SwissPPNFTL checkpoint serialization and verified reclamation transactions.
  * Native metadata: 13G36 IOFlashStorage-730 formatter at 0x81092408.
  * Range payload: cxtNextBatch at 0x8108f07c and the recovery decoder.
  *
  * Opaque accounting payloads survive byte-for-byte. Updating their native
- * accounting and committing VFL bank rotation remain separate work. No erase
- * callback or runtime GC worker is registered by this file.
+ * accounting and committing VFL bank rotation remain separate work.
  */
 #include <linux/bitops.h>
 #include <linux/errno.h>
@@ -30,7 +29,8 @@ struct apple_sftl_gc {
 	struct apple_sftl_gc_copy *copies;
 	struct apple_sftl_checkpoint *checkpoint;
 	u32 nr_copies, copied, max_records, victim, destination;
-	u64 retire_sequence, copied_sequence;
+	u64 retire_sequence, copied_sequence, victim_sequence;
+	u32 padding;
 	enum apple_sftl_gc_stage stage;
 };
 
@@ -237,7 +237,7 @@ int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,
 			u32 max_records, size_t max_bytes, struct apple_sftl_gc **out)
 {
 	struct apple_sftl_gc *gc;
-	u32 start, end, dest, capacity, copied = 0, i, count;
+	u32 start, end, dest, capacity, copied = 0, i, count, footer;
 	size_t map_bytes, copy_bytes, opaque_bytes;
 	int ret;
 
@@ -253,6 +253,9 @@ int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,
 	    victim->blank || !victim->closed || !destination->blank ||
 	    destination->last_sequence || victim->block == destination->block ||
 	    victim->last_sequence > snapshot->sequence)
+		return -EINVAL;
+	footer = victim->footer_chunks ? victim->footer_chunks : 32;
+	if (footer < 4 || footer > 32 || footer % 4)
 		return -EINVAL;
 	start = victim->block * APPLE_SFTL_STRIDE;
 	end = start + hweight16(victim->lanes) * 512;
@@ -282,6 +285,7 @@ int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,
 	gc->victim = victim->block;
 	gc->destination = destination->block;
 	gc->retire_sequence = max(victim->last_sequence, snapshot->sequence);
+	gc->victim_sequence = victim->last_sequence;
 	gc->copied_sequence = snapshot->sequence;
 	gc->snapshot.runs = kvzalloc(map_bytes, GFP_KERNEL);
 	gc->copies = kvzalloc(copy_bytes, GFP_KERNEL);
@@ -299,7 +303,7 @@ int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,
 
 		if (address != APPLE_SFTL_NO_ADDRESS &&
 		    sftl_overlap(address, run->length, start, start + APPLE_SFTL_STRIDE) &&
-		    min(address + run->length, start + APPLE_SFTL_STRIDE) > end - 32) {
+		    min(address + run->length, start + APPLE_SFTL_STRIDE) > end - footer) {
 			ret = -EBADMSG;
 			goto failed;
 		}
@@ -326,6 +330,21 @@ int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,
 		if (offset < run->length)
 			sftl_gc_run(&gc->snapshot, run->logical + offset,
 				    run->length - offset, address + offset);
+	}
+	/* Program complete pages. Repeat the first key in the leading slots:
+	 * its last copy then begins an uninterrupted run of live mappings.
+	 */
+	gc->padding = (4 - copied % 4) % 4;
+	if (gc->padding) {
+		for (i = 0; i < gc->nr_copies; i++)
+			gc->copies[i].destination += gc->padding;
+		for (i = 0; i < gc->snapshot.nr_runs; i++) {
+			struct apple_sftl_extent *run = &gc->snapshot.runs[i];
+
+			if (run->provider >= dest && run->provider < dest + capacity)
+				run->provider += gc->padding;
+		}
+		copied += gc->padding;
 	}
 	/* Copy records consume sequences before checkpoint serialization. */
 	if (copied > SFTL_SEQUENCE - snapshot->sequence) {
@@ -364,6 +383,13 @@ enum apple_sftl_gc_stage apple_sftl_gc_stage(const struct apple_sftl_gc *gc)
 }
 EXPORT_SYMBOL_GPL(apple_sftl_gc_stage);
 
+u32 apple_sftl_gc_copy_chunks(const struct apple_sftl_gc *gc)
+{
+	if (!gc || gc->stage != APPLE_SFTL_GC_COPY || gc->copied)
+		return 0;
+	return gc->snapshot.sequence - gc->copied_sequence;
+}
+
 const struct apple_sftl_gc_copy *apple_sftl_gc_next_copy(const struct apple_sftl_gc *gc)
 {
 	if (!gc || gc->stage != APPLE_SFTL_GC_COPY)
@@ -380,7 +406,8 @@ int apple_sftl_gc_copy_done(struct apple_sftl_gc *gc,
 	if (!expected || !receipt)
 		return -EINVAL;
 	if (memcmp(expected, receipt, sizeof(*receipt)) ||
-	    sequence != gc->copied_sequence + expected->length) {
+	    sequence != gc->copied_sequence + expected->length +
+			(gc->copied ? 0 : gc->padding)) {
 		gc->stage = APPLE_SFTL_GC_FAILED;
 		return -EBADMSG;
 	}
@@ -390,6 +417,106 @@ int apple_sftl_gc_copy_done(struct apple_sftl_gc *gc,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_sftl_gc_copy_done);
+
+static int sftl_gc_program(struct apple_sftl_gc_page *buffer,
+			   const struct apple_sftl_gc_page *page,
+			   const struct apple_sftl_gc_io *io, void *priv, u32 address)
+{
+	int ret;
+
+	ret = io->read(priv, address, buffer);
+	if (ret)
+		return ret;
+	if (memchr_inv(buffer, 0xff, sizeof(*buffer)))
+		return -EBADMSG;
+	ret = io->program(priv, address, page);
+	if (ret)
+		return ret;
+	ret = io->read(priv, address, buffer);
+	if (ret)
+		return ret;
+	return memcmp(page, buffer, sizeof(*page)) ? -EBADMSG : 0;
+}
+
+/* No erase or map publication occurs here. Even an indeterminate program
+ * consumes the transaction: the caller must recover before writing again.
+ */
+int apple_sftl_gc_relocate(struct apple_sftl_gc *gc,
+			   const struct apple_sftl_gc_io *io, void *priv)
+{
+	struct apple_sftl_gc_page *pages, *src, *dst;
+	u32 i, offset, slot = 0, cached = U32_MAX, repeat, address;
+	u64 sequence;
+	int ret = 0;
+
+	if (!gc || gc->stage != APPLE_SFTL_GC_COPY || gc->copied ||
+	    !io || !io->read || !io->program)
+		return -EINVAL;
+	pages = kvmalloc(2 * sizeof(*pages), GFP_NOIO);
+	if (!pages)
+		return -ENOMEM;
+	src = &pages[0];
+	dst = &pages[1];
+	address = gc->destination * APPLE_SFTL_STRIDE;
+	sequence = gc->copied_sequence;
+	repeat = 1 + gc->padding;
+	for (i = 0; i < gc->nr_copies; i++) {
+		const struct apple_sftl_gc_copy *copy = &gc->copies[i];
+
+		for (offset = 0; offset < copy->length; offset++) {
+			u32 from = copy->source + offset, key = copy->logical + offset;
+			const u8 *meta;
+			u64 stamp;
+
+			if (cached != (from & ~3U)) {
+				cached = from & ~3U;
+				ret = io->read(priv, cached, src);
+				if (ret)
+					goto failed;
+			}
+			meta = src->oob + (from & 3) * APPLE_SFTL_META;
+			stamp = get_unaligned_le64(meta) >> 16;
+			/* Only rewrite ordinary unflagged data in its native class. */
+			if (meta[0] != 1 || meta[1] || !stamp ||
+			    get_unaligned_le32(meta + 8) != key ||
+			    get_unaligned_le32(meta + 12) != stamp >> 16 ||
+			    stamp > gc->victim_sequence) {
+				ret = -EBADMSG;
+				goto failed;
+			}
+			do {
+				u8 *out = dst->oob + slot * APPLE_SFTL_META;
+
+				memcpy(dst->data + slot * APPLE_SFTL_CHUNK,
+				       src->data + (from & 3) * APPLE_SFTL_CHUNK,
+				       APPLE_SFTL_CHUNK);
+				sequence++;
+				put_unaligned_le64(sequence << 16 | 1, out);
+				put_unaligned_le32(key, out + 8);
+				put_unaligned_le32(sequence >> 16, out + 12);
+				if (++slot == 4) {
+					ret = sftl_gc_program(src, dst, io, priv, address);
+					if (ret)
+						goto failed;
+					cached = U32_MAX;
+					slot = 0;
+					address += 4;
+				}
+			} while (--repeat);
+			repeat = 1;
+		}
+	}
+	gc->copied = gc->nr_copies;
+	gc->copied_sequence = sequence;
+	gc->stage = APPLE_SFTL_GC_CHECKPOINT;
+	goto out;
+failed:
+	gc->stage = APPLE_SFTL_GC_FAILED;
+out:
+	kvfree(pages);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sftl_gc_relocate);
 
 int apple_sftl_gc_checkpoint(struct apple_sftl_gc *gc, const u32 *blocks,
 			     u32 nr_blocks, struct apple_sftl_checkpoint **out)
@@ -445,10 +572,77 @@ int apple_sftl_gc_checkpoint_done(struct apple_sftl_gc *gc,
 }
 EXPORT_SYMBOL_GPL(apple_sftl_gc_checkpoint_done);
 
-int apple_sftl_gc_recovered(struct apple_sftl_gc *gc,
+static bool sftl_maps_equal(const struct apple_sftl_snapshot *expected,
 			    const struct apple_sftl_snapshot *recovered)
 {
 	u32 wanted = 0, found = 0, offset = 0, length;
+
+	/* Compare logical mappings even when the cold reader coalesces ranges. */
+	while (wanted < expected->nr_runs && found < recovered->nr_runs) {
+		const struct apple_sftl_extent *a = &expected->runs[wanted];
+		const struct apple_sftl_extent *b = &recovered->runs[found];
+		u32 a_offset = offset - a->logical, b_offset = offset - b->logical;
+		u32 a_address = a->provider, b_address = b->provider;
+
+		if (a_address != APPLE_SFTL_NO_ADDRESS)
+			a_address += a_offset;
+		if (b_address != APPLE_SFTL_NO_ADDRESS)
+			b_address += b_offset;
+		if (a_address != b_address)
+			return false;
+		length = min(a->length - a_offset, b->length - b_offset);
+		offset += length;
+		if (offset == a->logical + a->length)
+			wanted++;
+		if (offset == b->logical + b->length)
+			found++;
+	}
+	return offset == APPLE_SFTL_LOGICAL_PAGES;
+}
+
+/*
+ * The durable checkpoint already supersedes every record in this closed
+ * block. Its own map must exclude the block (checked by the caller before
+ * replay), as must the full map independently recovered after replay.
+ */
+int apple_sftl_gc_plan_retired(const struct apple_sftl_snapshot *active,
+			       const struct apple_sftl_snapshot *cold,
+			       const struct apple_sftl_gc_block *victim,
+			       u64 checkpoint_start)
+{
+	u32 i, first;
+	int ret;
+
+	ret = sftl_check_map(active);
+	if (ret)
+		return ret;
+	ret = sftl_check_map(cold);
+	if (ret)
+		return ret;
+	if (!sftl_gc_block_valid(victim) || !victim->closed || victim->blank ||
+	    !checkpoint_start || checkpoint_start > cold->checkpoint_sequence ||
+	    victim->last_sequence >= checkpoint_start)
+		return -EOPNOTSUPP;
+	if (active->sequence != cold->sequence ||
+	    active->checkpoint_sequence != cold->checkpoint_sequence ||
+	    active->journal_sequence != active->sequence ||
+	    cold->journal_sequence != cold->sequence ||
+	    !sftl_maps_equal(active, cold))
+		return -EBADMSG;
+	first = victim->block * APPLE_SFTL_STRIDE;
+	for (i = 0; i < cold->nr_runs; i++) {
+		const struct apple_sftl_extent *run = &cold->runs[i];
+
+		if (run->provider != APPLE_SFTL_NO_ADDRESS &&
+		    sftl_overlap(run->provider, run->length, first, first + APPLE_SFTL_STRIDE))
+			return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+int apple_sftl_gc_recovered(struct apple_sftl_gc *gc,
+			    const struct apple_sftl_snapshot *recovered)
+{
 	int ret;
 
 	if (!gc || gc->stage != APPLE_SFTL_GC_RECOVERY)
@@ -463,29 +657,7 @@ int apple_sftl_gc_recovered(struct apple_sftl_gc *gc,
 		ret = -EBADMSG;
 		goto failed;
 	}
-	/* Compare logical mappings even when the cold reader coalesces ranges. */
-	while (wanted < gc->snapshot.nr_runs && found < recovered->nr_runs) {
-		const struct apple_sftl_extent *a = &gc->snapshot.runs[wanted];
-		const struct apple_sftl_extent *b = &recovered->runs[found];
-		u32 a_offset = offset - a->logical, b_offset = offset - b->logical;
-		u32 a_address = a->provider, b_address = b->provider;
-
-		if (a_address != APPLE_SFTL_NO_ADDRESS)
-			a_address += a_offset;
-		if (b_address != APPLE_SFTL_NO_ADDRESS)
-			b_address += b_offset;
-		if (a_address != b_address) {
-			ret = -EBADMSG;
-			goto failed;
-		}
-		length = min(a->length - a_offset, b->length - b_offset);
-		offset += length;
-		if (offset == a->logical + a->length)
-			wanted++;
-		if (offset == b->logical + b->length)
-			found++;
-	}
-	if (offset != APPLE_SFTL_LOGICAL_PAGES) {
+	if (!sftl_maps_equal(&gc->snapshot, recovered)) {
 		ret = -EBADMSG;
 		goto failed;
 	}

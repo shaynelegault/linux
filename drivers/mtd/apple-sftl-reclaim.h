@@ -50,6 +50,8 @@ int apple_sftl_context_meta(u8 *meta, u8 subtype, u64 sequence,
 struct apple_sftl_gc_block {
 	u32 block;
 	u16 lanes;
+	/* A zero source footer width uses the writer's conservative 32 chunks. */
+	u16 footer_chunks;
 	bool blank, closed, reserved;
 	u64 last_sequence;
 };
@@ -68,20 +70,43 @@ enum apple_sftl_gc_stage {
 
 struct apple_sftl_gc;
 
-/* These routines plan and validate supplied bytes. They perform no media IO. */
+/*
+ * Page-aligned provider addresses use the same 4 KiB units as the map.
+ * The caller owns the checked blank destination and excludes all other
+ * writers, including raw MTD, until the transaction finishes.
+ * Reads must report media errors. A program failure can be indeterminate.
+ */
+struct apple_sftl_gc_page {
+	u8 data[4 * APPLE_SFTL_CHUNK];
+	u8 oob[4 * APPLE_SFTL_META];
+};
+
+struct apple_sftl_gc_io {
+	int (*read)(void *priv, u32 address, struct apple_sftl_gc_page *page);
+	int (*program)(void *priv, u32 address, const struct apple_sftl_gc_page *page);
+};
+
+/* Planning consumes supplied bytes. Relocation performs verified page I/O. */
 int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,
 		       const struct apple_sftl_gc_block *victim,
 		       const struct apple_sftl_gc_block *destination,
 			u32 max_records, size_t max_bytes, struct apple_sftl_gc **out);
 void apple_sftl_gc_free(struct apple_sftl_gc *gc);
 enum apple_sftl_gc_stage apple_sftl_gc_stage(const struct apple_sftl_gc *gc);
+u32 apple_sftl_gc_copy_chunks(const struct apple_sftl_gc *gc);
 const struct apple_sftl_gc_copy *apple_sftl_gc_next_copy(const struct apple_sftl_gc *gc);
 int apple_sftl_gc_copy_done(struct apple_sftl_gc *gc,
 			    const struct apple_sftl_gc_copy *receipt, u64 sequence);
+int apple_sftl_gc_relocate(struct apple_sftl_gc *gc,
+			   const struct apple_sftl_gc_io *io, void *priv);
 int apple_sftl_gc_checkpoint(struct apple_sftl_gc *gc, const u32 *blocks,
 			     u32 nr_blocks, struct apple_sftl_checkpoint **out);
 int apple_sftl_gc_checkpoint_done(struct apple_sftl_gc *gc,
 				  const struct apple_sftl_checkpoint *readback);
+int apple_sftl_gc_plan_retired(const struct apple_sftl_snapshot *active,
+			       const struct apple_sftl_snapshot *cold,
+			       const struct apple_sftl_gc_block *victim,
+			       u64 checkpoint_start);
 int apple_sftl_gc_recovered(struct apple_sftl_gc *gc,
 			    const struct apple_sftl_snapshot *recovered);
 
