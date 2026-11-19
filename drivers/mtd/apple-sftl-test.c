@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Synthetic VFL/SFTL medium. No firmware or captured device bytes. */
 #include <kunit/test.h>
+#include <linux/blkdev.h>
 #include <linux/errno.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/mtd/apple-ppn.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
@@ -2375,6 +2379,173 @@ static void sftl_test_gc_native_spare_reuse(struct kunit *test)
 	apple_sftl_checkpoint_free(f->checkpoint);
 }
 
+/* Open only the disk registered by this fixture. */
+static struct file *sftl_test_disk_file(struct platform_device *pdev, blk_mode_t mode)
+{
+	struct device *child = device_find_any_child(&pdev->dev);
+	struct file *file;
+
+	if (!child)
+		return ERR_PTR(-ENODEV);
+	file = bdev_file_open_by_dev(child->devt, mode, NULL, NULL);
+	put_device(child);
+	return file;
+}
+
+static int sftl_test_write_disk_page(struct file *file, u32 key, const u8 *data)
+{
+	loff_t start = (loff_t)key * APPLE_SFTL_CHUNK;
+	loff_t pos = start;
+	ssize_t bytes;
+
+	bytes = kernel_write(file, data, APPLE_SFTL_CHUNK, &pos);
+	if (bytes != APPLE_SFTL_CHUNK)
+		return bytes < 0 ? bytes : -EIO;
+	return vfs_fsync_range(file, start, pos - 1, 1);
+}
+
+static int sftl_test_disk_reuse(struct kunit *test, struct file *file,
+				struct sftl_fixture *f, u8 *data)
+{
+	const u32 key = TEST_APPEND_BASE + 5;
+	struct sftl_test_page *row;
+	unsigned int i;
+	int ret;
+
+	memset(data, 'W', APPLE_SFTL_CHUNK);
+	ret = sftl_test_write_disk_page(file, key, data);
+	if (ret)
+		return ret;
+	KUNIT_EXPECT_EQ(test, f->native_policy_calls, 1U);
+	KUNIT_EXPECT_EQ(test, f->stats_calls, 2U);
+	KUNIT_EXPECT_EQ(test, f->finish_calls, 1U);
+	KUNIT_EXPECT_EQ(test, f->erased_context_lanes, 3U);
+	KUNIT_EXPECT_TRUE(test, f->loaded_before_retirement);
+	KUNIT_EXPECT_TRUE(test, f->loaded_after_retirement);
+	KUNIT_EXPECT_PTR_EQ(test, sftl_test_written(f, 0, 0, 0), NULL);
+	if (f->erases != 3)
+		return -ENODATA;
+
+	/* Two relocation programs and the pending write used the first three
+	 * landing pages. Sync each subsequent write so it reaches the medium.
+	 */
+	for (i = 3; i <= TEST_APPEND_PROGRAMS; i++) {
+		if (i == TEST_APPEND_PROGRAMS)
+			memset(data, 'R', APPLE_SFTL_CHUNK);
+		ret = sftl_test_write_disk_page(file, key, data);
+		if (ret)
+			return ret;
+	}
+	row = sftl_test_written(f, 0, 0, 0);
+	if (!row)
+		return -ENODATA;
+	KUNIT_EXPECT_MEMEQ(test, row->data, data, APPLE_SFTL_CHUNK);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(row->oob + 8), key);
+	KUNIT_EXPECT_EQ(test, f->erases, 3U);
+	KUNIT_EXPECT_EQ(test, f->program_outside, 0U);
+	return 0;
+}
+
+static int sftl_test_read_rebound_disk(struct kunit *test, struct file *file, u8 *data)
+{
+	unsigned int i;
+
+	for (i = 0; i <= 5; i++) {
+		loff_t pos = (loff_t)(TEST_APPEND_BASE + i) * APPLE_SFTL_CHUNK;
+		ssize_t bytes = kernel_read(file, data, APPLE_SFTL_CHUNK, &pos);
+
+		if (bytes != APPLE_SFTL_CHUNK)
+			return bytes < 0 ? bytes : -EIO;
+		sftl_test_expect_fill(test, data, i == 5 ? 'R' : 119 + i);
+	}
+	return 0;
+}
+
+static void sftl_test_gc_through_block_device(struct kunit *test)
+{
+	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+	u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	struct platform_device *pdev;
+	struct file *file;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	KUNIT_ASSERT_EQ(test, sftl_test_native_medium(f, data), 0);
+	f->ops.erase_block = sftl_test_native_erase;
+	f->provider.checkpoint_ops = &sftl_test_native_ops;
+	pdev = platform_device_register_data(NULL, "apple-sftl", PLATFORM_DEVID_AUTO,
+					     &f->provider, sizeof(f->provider));
+	if (IS_ERR(pdev)) {
+		ret = PTR_ERR(pdev);
+		goto free_checkpoint;
+	}
+	file = sftl_test_disk_file(pdev, BLK_OPEN_READ | BLK_OPEN_WRITE);
+	if (IS_ERR(file)) {
+		ret = PTR_ERR(file);
+		goto unregister;
+	}
+	ret = sftl_test_disk_reuse(test, file, f, data);
+	__fput_sync(file);
+	if (!ret)
+		ret = device_reprobe(&pdev->dev);
+	if (!ret) {
+		file = sftl_test_disk_file(pdev, BLK_OPEN_READ);
+		if (IS_ERR(file)) {
+			ret = PTR_ERR(file);
+		} else {
+			ret = sftl_test_read_rebound_disk(test, file, data);
+			__fput_sync(file);
+		}
+	}
+unregister:
+	platform_device_unregister(pdev);
+free_checkpoint:
+	apple_sftl_checkpoint_free(f->checkpoint);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+}
+
+static void sftl_test_block_requires_erase_and_policy(struct kunit *test)
+{
+	u8 *data = kunit_kmalloc(test, APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	for (i = 0; i < 2; i++) {
+		struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
+		struct platform_device *pdev;
+		struct sftl_test_page *donor;
+		struct file *file;
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		KUNIT_ASSERT_EQ(test, sftl_test_native_medium(f, data), 0);
+		donor = sftl_test_written(f, 0, 0, 0);
+		if (i == 0)
+			f->provider.checkpoint_ops = &sftl_test_native_ops;
+		else
+			f->ops.erase_block = sftl_test_native_erase;
+		pdev = platform_device_register_data(NULL, "apple-sftl", PLATFORM_DEVID_AUTO,
+						     &f->provider, sizeof(f->provider));
+		ret = PTR_ERR_OR_ZERO(pdev);
+		if (!ret) {
+			file = sftl_test_disk_file(pdev, BLK_OPEN_READ | BLK_OPEN_WRITE);
+			ret = PTR_ERR_OR_ZERO(file);
+			if (!ret) {
+				memset(data, 'W', APPLE_SFTL_CHUNK);
+				ret = sftl_test_write_disk_page(file, TEST_APPEND_BASE + 5, data);
+				__fput_sync(file);
+			}
+			platform_device_unregister(pdev);
+		}
+		apple_sftl_checkpoint_free(f->checkpoint);
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_EXPECT_EQ(test, f->native_policy_calls, 0U);
+		KUNIT_EXPECT_EQ(test, f->erases, 0U);
+		KUNIT_EXPECT_PTR_EQ(test, sftl_test_written(f, 0, 0, 0), donor);
+	}
+}
+
 static void sftl_test_gc_native_event_stats(struct kunit *test)
 {
 	struct sftl_fixture *f = sftl_test_fixture(test, SFTL_NO_FAULT);
@@ -3129,6 +3300,8 @@ static struct kunit_case apple_sftl_cases[] = {
 	KUNIT_CASE(sftl_test_gc_native_publication),
 	KUNIT_CASE(sftl_test_gc_native_finish_failure),
 	KUNIT_CASE(sftl_test_gc_native_spare_reuse),
+	KUNIT_CASE(sftl_test_gc_through_block_device),
+	KUNIT_CASE(sftl_test_block_requires_erase_and_policy),
 	KUNIT_CASE(sftl_test_gc_native_event_stats),
 	KUNIT_CASE(sftl_test_gc_native_stats_failure),
 	KUNIT_CASE(sftl_test_gc_native_reservations),

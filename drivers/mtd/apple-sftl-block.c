@@ -219,6 +219,9 @@ static int sftl_disk_probe(struct platform_device *pdev)
 	/* Appending continues the journal; it must end where the map does. */
 	sftl->writable = provider->ops->program_page && !info.read_only &&
 			 info.sequence == info.journal_sequence;
+	if (sftl->writable && provider->ops->erase_block && provider->checkpoint_ops)
+		apple_sftl_set_checkpoint_ops(sftl->ftl, provider->checkpoint_ops,
+					      provider->priv);
 	if (info.read_only)
 		dev_warn(&pdev->dev, "incomplete metadata publication, read-only\n");
 	else if (provider->ops->program_page && !sftl->writable)

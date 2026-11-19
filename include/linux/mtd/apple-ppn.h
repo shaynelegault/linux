@@ -6,6 +6,7 @@
 
 struct device;
 struct apple_ppn_access;
+struct apple_sftl_checkpoint_ops;
 
 #define APPLE_PPN_PAGE_SIZE 16384
 #define APPLE_PPN_OOB_SIZE 64
@@ -38,6 +39,10 @@ struct apple_ppn {
 	u16 pages;
 	/* Shared by all raw writers on media also exposed through SFTL. */
 	struct apple_ppn_access *access;
+	/* Optional checkpoint policy for the bound disk. Callbacks use priv
+	 * and must remain valid until the provider unregisters its child.
+	 */
+	const struct apple_sftl_checkpoint_ops *checkpoint_ops;
 };
 
 #endif
