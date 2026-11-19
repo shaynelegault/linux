@@ -94,6 +94,7 @@ int apple_sftl_gc_plan(const struct apple_sftl_snapshot *snapshot,
 void apple_sftl_gc_free(struct apple_sftl_gc *gc);
 enum apple_sftl_gc_stage apple_sftl_gc_stage(const struct apple_sftl_gc *gc);
 u32 apple_sftl_gc_copy_chunks(const struct apple_sftl_gc *gc);
+bool apple_sftl_gc_has_sequence_room(const struct apple_sftl_gc *gc, u32 pending);
 const struct apple_sftl_gc_copy *apple_sftl_gc_next_copy(const struct apple_sftl_gc *gc);
 int apple_sftl_gc_copy_done(struct apple_sftl_gc *gc,
 			    const struct apple_sftl_gc_copy *receipt, u64 sequence);

@@ -216,9 +216,10 @@ config MTD_APPLE_SFTL
 	  Unsupported checkpoints, missing journal sequences and refresh
 	  requirements stop recovery before a disk is registered.
 
-	  Writes are appended to verified blank blocks.  There is no erase or
-	  garbage collection yet, so writes fail with ENOSPC once the blank
-	  blocks are used up; reads keep working.
+	  Writes are appended to verified blank blocks. A provider with a
+	  qualified erase operation can also recycle verified retired blocks.
+	  The physical P105 provider remains append-only and returns ENOSPC
+	  when its supply of blank blocks runs out.
 
 config MTD_APPLE_SFTL_KUNIT_TEST
 	tristate "KUnit tests for Apple VFL/SwissPPNFTL" if !KUNIT_ALL_TESTS
@@ -227,8 +228,8 @@ config MTD_APPLE_SFTL_KUNIT_TEST
 	help
 	  Synthesize complete VFL/SFTL media and exercise checkpoint recovery,
 	  native block summaries, open-block journal replay, checkpoint encoding
-	  and offline reclamation transactions. Malformed replicas and unsupported
-	  layouts must fail without storage writes.
+	  and verified reclamation during normal writes. Exercise failed erase,
+	  readback and recovery using synthetic flash.
 	  Also test complete programs, interrupted summaries, allocation
 	  limits and fresh-loader replay.
 	  All test media and provider operations are synthetic.

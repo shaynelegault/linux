@@ -216,8 +216,9 @@ config MTD_APPLE_H2FMI
 	  driver.  One MTD per CAU; geometry is read from each package.
 
 	  Pages are programmed whole, only when they read back erased, and
-	  each program is verified by reading it back.  The driver has no
-	  erase operation.
+	  each program is verified by reading it back. The aggregate PPN
+	  provider can verify a single-block erase on qualified hardware.
+	  Erase is disabled on the P105.
 
 	  If unsure, say N.
 
@@ -226,7 +227,7 @@ config MTD_APPLE_H2FMI_KUNIT_TEST
 	depends on KUNIT
 	default KUNIT_ALL_TESTS
 	help
-	  Test PPN parameter parsing, row encoding and page-status handling.
+	  Test PPN parameter parsing, erase row bounds and page-status handling.
 	  Both measured PPN package profiles are covered.
 	  These tests use synthetic parameter pages and do not access hardware.
 

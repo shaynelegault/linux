@@ -7,9 +7,37 @@ The measured 64 GB PPN layout shares one FTL across the logical partitions.
 A Linux partition therefore provides no exclusive ownership of a physical
 block. Reclamation must preserve the recovered map for the whole device.
 
-The code in ``apple-sftl-reclaim.c`` serializes checkpoint images and plans
-transactions from supplied snapshots and completion receipts. It registers
-no media operation. The block device retains its existing access policy.
+The block writer allocates from verified blank blocks. An optional, verified
+``erase_block`` provider operation lets the allocator also reclaim obsolete
+blocks. A checkpoint backend with atomic installation and retirement of the
+previous fallback additionally permits relocation of live data. P105 H2FMI
+provides neither facility on the current hardware profile. When verified
+blank blocks run out on that profile, a write returns ``-ENOSPC``.
+
+Reclaiming an obsolete block
+----------------------------
+
+The allocator records the blocks referenced by the saved checkpoint before
+replaying the journal. It requires a single visible checkpoint generation
+for erase eligibility. If an older generation is also visible, its fallback
+map can still own blocks. An obsolete candidate must be absent from both
+the saved map and the active map, including the logical keys outside the
+exported disk. The allocator excludes VFL and FTL context blocks, the
+bootstrap range and blocks with unknown active-lane flags. It loads the
+medium again and compares the whole recovered map and its sequence numbers
+with the active instance.
+
+The allocator reads the native footer and checks its runs against the
+logical key and sequence in every data record. Its highest declared
+sequence must precede the first record in the checkpoint. Even an obsolete
+write or trim after the checkpoint can be needed for contiguous replay.
+
+For an eligible block, the provider erases one active lane at a time.
+The allocator checks every normal-view data and OOB byte for the erased
+value before it hands the block to the waiting write. An indeterminate
+erase or failed blank verification stops I/O on that writer instance.
+Synthetic KUnit media exercise exhaustion, reclamation, reuse and cold
+recovery through the block writer's allocation path.
 
 Checkpoint images
 -----------------
@@ -34,38 +62,50 @@ data loss during format work; a native writer must update the fields whose
 meaning depends on relocation. These images have not been qualified for
 native checkpoint installation.
 
-Offline transaction
--------------------
+Relocating live data
+--------------------
 
 ``apple_sftl_gc_plan()`` consumes a whole-device snapshot plus descriptions
 of a closed victim and a fully checked blank destination. It rejects reserved
 blocks, references into the victim's footer or inactive space, a destination
-still referenced by the map, insufficient destination capacity and a working
-plan buffers exceeding the caller's budget. A source with an allocation
+still referenced by the map, insufficient destination capacity and plan
+buffers exceeding the caller's budget. A source with an allocation
 floor above the last replayed record is excluded under the current recovery
-contract. Copies retain the logical keys while
-moving their provider addresses. Destination space leaves eight pages for
-a future native summary.
+contract. Copies retain the logical keys while moving their provider
+addresses. Destination space leaves eight pages for a future native summary.
 
-The transaction advances through explicit receipt checks:
+With both callbacks installed, allocation can use the last verified blank
+block to compact a closed source still referenced by the saved checkpoint.
+The allocator checks the source footer and data records before writing,
+accepts unflagged type 1 data for relocation, and budgets enough destination
+space and sequence numbers for the incoming write. The public KUnit tests
+exercise this through the normal write path with a synthetic checkpoint
+backend.
 
-* Each copy receipt must match its planned logical range, source,
-  destination and final sequence. The caller must issue and verify that IO.
-* A complete checkpoint image is built only after the copy receipts arrive.
-  Its readback must match every metadata and payload byte.
+* ``apple_sftl_gc_relocate()`` reads each planned source key and checks its
+  metadata. It assembles four 4 KiB records per program unit and repeats the
+  first key when padding is needed. It checks that each destination page is
+  blank, programs it, then compares all data and OOB bytes with readback.
+* The checkpoint backend reserves context blocks before copying. After the
+  copies complete it installs the new checkpoint, retires the previous
+  fallback, and returns independent readback. Every metadata and payload
+  byte must match the submitted image.
 * A fresh recovery snapshot must contain the planned whole-device mapping
-  and the new checkpoint sequence. Equivalent coalescing is accepted.
+  and the new checkpoint sequence. Equivalent coalescing is accepted. The
+  allocator checks ownership and lane assignments again before erasing the
+  source. The pending write uses the free tail of the destination, and the
+  verified erased source becomes the next spare.
 
-The supplied blank, reserved and lane descriptions are trusted inputs. They
-must come from authoritative VFL and context ownership checks before any
-future destructive IO can use a plan. The present receipt checks cannot
-establish those physical ownership facts.
+Standalone planner callers supply the blank, reserved and lane descriptions.
+At runtime the allocator derives these from its VFL and context state and
+from a scan of the candidate. Exposing the erase operation requires the
+caller to own the complete physical erase extent across all affected views.
 
-A mismatched receipt moves the transaction to its failed state. Even a victim
-with zero current references must pass checkpoint and cold-recovery stages,
-since the current replay contract can still require its obsolete history.
-The final VERIFIED state means that these supplied receipts passed. It does
-not certify native accounting or VFL commit durability.
+A copy I/O failure or mismatched receipt moves the transaction to its failed
+state. A victim with live data or required replay history must survive
+until a new checkpoint is durably installed and recovered. VERIFIED records
+successful checks against the supplied checkpoint and recovery receipts.
+Native accounting and VFL rotation still require qualification.
 
 Outstanding native protocol work
 -------------------------------
@@ -88,10 +128,11 @@ fields. Both saved parameter copies agree: page bits 7, block bits 12 and CAU
 bits 3. A normal block's page-0 row is ``(cau << 19) | (block << 7)``; the SLC
 view adds bit 22. The normal view reports 128 pages per block. Physical erase
 effects, the SLC alias relationship, timeout, retirement and partial completion
-across CAUs remain unqualified. The provider exposes no erase
-callback. Enabling physical reclamation requires resolving those semantics
-and qualifying the exact candidate with device recovery and interruption
-checks.
+across CAUs remain unqualified. The H2FMI implementation issues the
+single-row command and checks the erased status, data and OOB on all 128
+normal-view pages. Enabling its callback on hardware requires a qualified
+physical erase extent, exclusive ownership across all affected views, and
+device recovery and interruption checks.
 
 The source research began with `Cascadia's NAND notes
 <https://github.com/rzxvx/Project-Cascadia/blob/c20b85ebb951c704d7e3a664c378dde8276e3928/docs/research/p105-nand.md>`_.

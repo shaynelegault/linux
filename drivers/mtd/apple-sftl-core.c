@@ -39,6 +39,7 @@
 #define SFTL_FOOTER_CHUNKS 32U
 #define SFTL_CLAIM_TIMEOUT (500U * HZ)
 #define SFTL_FOOTER_BYTES (SFTL_FOOTER_CHUNKS * SFTL_CHUNK)
+#define SFTL_GC_MAP_BYTES (8U * 1024 * 1024) /* per map, on the measured 512 MiB P105 */
 
 struct sftl_run {
 	struct rb_node node;
@@ -69,10 +70,16 @@ struct apple_sftl {
 	u16 lanes[SFTL_BLOCKS];
 	DECLARE_BITMAP(reserved, SFTL_BLOCKS);
 	DECLARE_BITMAP(vfl_reserved, SFTL_BLOCKS);
+	DECLARE_BITMAP(unknown_lane_flags, SFTL_BLOCKS);
+	DECLARE_BITMAP(checkpoint_used, SFTL_BLOCKS);
+	DECLARE_BITMAP(old_closed, SFTL_BLOCKS);
+	u64 checkpoint_start;
 	u64 checkpoint_sequence, sequence, journal_sequence;
 	DECLARE_BITMAP(candidates, SFTL_BLOCKS);
 	DECLARE_BITMAP(used, SFTL_BLOCKS);
-	u32 next_candidate, append_block, append_position, append_capacity;
+	u32 next_candidate, append_block, append_position, append_capacity, spare;
+	const struct apple_sftl_checkpoint_ops *checkpoint_ops;
+	void *checkpoint_priv;
 	u32 footer_runs;
 	u64 append_base;
 	u8 *footer;
@@ -467,9 +474,15 @@ static int sftl_vfl(struct apple_sftl *sftl)
 				goto out;
 			}
 		}
-		for (block = 0; block < SFTL_BLOCKS; block++)
-			if (!(get_unaligned_le16(table + block * 2) & BIT(15)))
+		for (block = 0; block < SFTL_BLOCKS; block++) {
+			u16 value = get_unaligned_le16(table + block * 2);
+
+			if (!(value & BIT(15))) {
 				sftl->lanes[block] |= BIT(lane);
+				if (value)
+					__set_bit(block, sftl->unknown_lane_flags);
+			}
+		}
 	}
 	ret = 0;
 out:
@@ -633,6 +646,9 @@ static int sftl_context(struct apple_sftl *sftl, const u8 *heads)
 		if (ret)
 			goto out;
 	}
+	/* Older saved generations have separate maps we have not validated. */
+	if (!first)
+		sftl->checkpoint_start = records.items[0].stamp & SFTL_SEQUENCE;
 	sftl->checkpoint_sequence = fragment_sequence;
 	sftl->sequence = fragment_sequence;
 	ret = 0;
@@ -675,8 +691,11 @@ static int sftl_footer(struct apple_sftl *sftl, const u8 *head, u32 block,
 	    base != sftl_sequence(head) || !span || base + span > SFTL_SEQUENCE + 1)
 		return -EBADMSG;
 	*floor = max(*floor, base + span - 1);
-	if (base + span - 1 <= sftl->checkpoint_sequence)
+	if (base + span - 1 <= sftl->checkpoint_sequence) {
+		if (head[0] == 1 && base && base + span - 1 < sftl->checkpoint_start)
+			__set_bit(block, sftl->old_closed);
 		return 0;
+	}
 	footer = kmalloc(chunks * SFTL_CHUNK, GFP_KERNEL);
 	if (!footer)
 		return -ENOMEM;
@@ -749,7 +768,7 @@ out:
 }
 
 static bool sftl_partial_footer(struct apple_sftl *sftl, const u8 *head,
-				u32 position, u32 pages)
+				u32 position, u32 pages, u64 span)
 {
 	const u8 *meta = sftl->oob;
 	unsigned int chunk;
@@ -757,7 +776,7 @@ static bool sftl_partial_footer(struct apple_sftl *sftl, const u8 *head,
 	if (position < pages - SFTL_FOOTER_CHUNKS / 4 ||
 	    meta[0] != 0x1c || meta[1] != SFTL_FOOTER_CHUNKS * 2 ||
 	    sftl_sequence(meta) != sftl_sequence(head) ||
-	    get_unaligned_le32(meta + 8) != pages * 4 - SFTL_FOOTER_CHUNKS ||
+	    get_unaligned_le32(meta + 8) != span ||
 	    get_unaligned_le16(meta + 12) != SFTL_FOOTER_CHUNKS ||
 	    get_unaligned_le16(meta + 14) != 0xffff)
 		return false;
@@ -771,6 +790,7 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads)
 {
 	struct sftl_records journal = {};
 	u64 floor = sftl->checkpoint_sequence, expected = floor + 1;
+	u64 checkpoint_first = sftl->context.items[0].stamp & SFTL_SEQUENCE;
 	u32 block, position, i, pages;
 	unsigned int chunk;
 	int ret;
@@ -778,6 +798,7 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads)
 	for (block = 1; block < SFTL_SUBBLOCKS; block++) {
 		const u8 *head = heads + block * SFTL_META;
 		bool complete_prefix = true, partial_footer = false;
+		u64 base = sftl_sequence(head), next = base;
 
 		if (head[0] != 1 && head[0] != 2)
 			continue;
@@ -808,20 +829,27 @@ static int sftl_journal(struct apple_sftl *sftl, const u8 *heads)
 			if (position < pages - SFTL_FOOTER_CHUNKS / 4) {
 				for (chunk = 0; chunk < 4; chunk++) {
 					const u8 *meta = sftl->oob + chunk * SFTL_META;
-					u64 sequence = sftl_sequence(head) + position * 4 + chunk;
+					u64 sequence = sftl_sequence(meta);
 
-					if (meta[0] != 1 || meta[1] ||
-					    sftl_sequence(meta) != sequence ||
+					if (meta[0] != 1 || meta[1] || sequence < next ||
 					    get_unaligned_le32(meta + 12) != sequence >> 16)
 						complete_prefix = false;
+					/* A checkpoint occupies its own sequence numbers between pages. */
+					if (sequence > next &&
+					    (!position || chunk || next != checkpoint_first ||
+					     sequence != sftl->checkpoint_sequence + 1))
+						complete_prefix = false;
+					next = sequence + 1;
 				}
 			}
-			/* An incomplete final summary leaves the last page erased.
-			 * Its full contiguous data prefix must still validate directly.
-			 * The partially written summary payload is never trusted.
+			/* A closing footer may follow a checkpoint that consumed
+			 * sequences between two data pages in the same block. Match
+			 * its span to the observed data, including that interval.
 			 */
-			if (sftl_partial_footer(sftl, head, position, pages)) {
-				if (!complete_prefix) {
+			if (sftl->oob[0] == 0x1c) {
+				if (!complete_prefix ||
+				    !sftl_partial_footer(sftl, head, position, pages,
+							 next - base)) {
 					ret = -EBADMSG;
 					goto out;
 				}
@@ -889,6 +917,23 @@ out:
 	return ret;
 }
 
+static void sftl_mark_mapped(struct apple_sftl *sftl, unsigned long *blocks)
+{
+	struct rb_node *node;
+	u32 block;
+
+	for (node = rb_first(&sftl->runs); node; node = rb_next(node)) {
+		struct sftl_run *run = rb_entry(node, struct sftl_run, node);
+		u32 end;
+
+		if (run->provider == SFTL_UNMAPPED)
+			continue;
+		end = (run->provider + run->end - run->start - 1) / SFTL_STRIDE;
+		for (block = run->provider / SFTL_STRIDE; block <= end; block++)
+			__set_bit(block, blocks);
+	}
+}
+
 int apple_sftl_load(struct apple_ppn *provider, struct apple_sftl **out)
 {
 	struct apple_sftl *sftl;
@@ -911,6 +956,7 @@ int apple_sftl_load(struct apple_ppn *provider, struct apple_sftl **out)
 	sftl->runs = RB_ROOT;
 	sftl->append_block = U32_MAX;
 	sftl->next_candidate = 1;
+	sftl->spare = U32_MAX;
 	mutex_init(&sftl->lock);
 	sftl->page = kmalloc(APPLE_PPN_PAGE_SIZE, GFP_KERNEL);
 	heads = kcalloc(SFTL_BLOCKS, SFTL_META, GFP_KERNEL);
@@ -944,6 +990,8 @@ int apple_sftl_load(struct apple_ppn *provider, struct apple_sftl **out)
 	ret = sftl_context(sftl, heads);
 	if (ret)
 		goto failed;
+	/* A map entry superseded by journal replay still belongs to the saved map. */
+	sftl_mark_mapped(sftl, sftl->checkpoint_used);
 	ret = sftl_journal(sftl, heads);
 	if (ret)
 		goto failed;
@@ -1020,7 +1068,6 @@ EXPORT_SYMBOL_GPL(apple_sftl_read);
 /* Caller holds sftl->lock. Every candidate is checked in full before use. */
 static int sftl_writer_prepare(struct apple_sftl *sftl)
 {
-	struct rb_node *node;
 	u32 block;
 
 	if (sftl->writer_prepared)
@@ -1038,65 +1085,287 @@ static int sftl_writer_prepare(struct apple_sftl *sftl)
 	__set_bit(0, sftl->used);
 	__set_bit(SFTL_SUBBLOCKS, sftl->used);
 	__set_bit(SFTL_SUBBLOCKS + 1, sftl->used);
-	for (node = rb_first(&sftl->runs); node; node = rb_next(node)) {
-		struct sftl_run *run = rb_entry(node, struct sftl_run, node);
-		u32 end;
-
-		if (run->provider == SFTL_UNMAPPED)
-			continue;
-		end = (run->provider + run->end - run->start - 1) / SFTL_STRIDE;
-		for (block = run->provider / SFTL_STRIDE; block <= end; block++)
-			__set_bit(block, sftl->used);
-	}
+	sftl_mark_mapped(sftl, sftl->used);
 	sftl->writer_prepared = true;
 	return 0;
 }
 
-static int sftl_claim_block(struct apple_sftl *sftl)
+/* Caller holds the live map lock or owns an unpublished cold loader. */
+static void sftl_copy_map(struct apple_sftl *sftl, struct apple_sftl_snapshot *snapshot)
 {
-	unsigned long deadline = jiffies + SFTL_CLAIM_TIMEOUT;
-	u32 block;
+	struct rb_node *node;
+	u32 i = 0;
 
-	while (sftl->next_candidate < SFTL_SUBBLOCKS) {
-		u32 capacity, position;
-		unsigned int chunk;
-		bool blank = true;
-		int ret;
+	for (node = rb_first(&sftl->runs); node; node = rb_next(node)) {
+		const struct sftl_run *run = rb_entry(node, struct sftl_run, node);
 
-		block = sftl->next_candidate++;
-		if (!test_bit(block, sftl->candidates) ||
-		    test_bit(block, sftl->used) || !sftl->lanes[block])
+		snapshot->runs[i++] = (struct apple_sftl_extent) {
+			.logical = run->start, .length = run->end - run->start,
+			.provider = run->provider,
+		};
+	}
+	snapshot->nr_runs = sftl->nr_runs;
+	snapshot->sequence = sftl->sequence;
+	snapshot->journal_sequence = sftl->journal_sequence;
+	snapshot->checkpoint_sequence = sftl->checkpoint_sequence;
+}
+
+/* Verify the native summary against every chunk it describes.  A cold loader
+ * can skip old footers, but their claimed sequence ceiling alone cannot
+ * authorize erase. Unknown record kinds remain on media.
+ */
+static int sftl_verify_closed(struct apple_sftl *sftl, struct apple_sftl_gc_block *victim,
+			      unsigned long deadline, bool relocate)
+{
+	u32 first = victim->block * SFTL_STRIDE, capacity = hweight16(victim->lanes) * 512;
+	u32 chunks, span, i, position = 0, previous_end = 0;
+	unsigned int chunk;
+	u8 trailer[SFTL_META];
+	u64 base;
+	int ret;
+
+	ret = sftl_read_address(sftl, first + capacity - 4, &chunk);
+	if (ret)
+		return ret;
+	memcpy(trailer, sftl->oob, SFTL_META);
+	chunks = get_unaligned_le16(trailer + 12);
+	span = get_unaligned_le32(trailer + 8);
+	base = sftl_sequence(trailer);
+	if (trailer[0] != 0x1c || chunks < 4 || chunks > SFTL_FOOTER_CHUNKS ||
+	    chunks % 4 || trailer[1] >> 1 != chunks ||
+	    get_unaligned_le16(trailer + 14) != 0xffff || !base || !span ||
+	    base + span - 1 >= sftl->checkpoint_start)
+		return -EOPNOTSUPP;
+	for (i = 0; i < chunks; i += 4) {
+		ret = sftl_read_address(sftl, first + capacity - chunks + i, &chunk);
+		if (ret)
+			return ret;
+		for (chunk = 0; chunk < 4; chunk++)
+			if (memcmp(sftl->oob + chunk * SFTL_META, trailer, SFTL_META))
+				return -EBADMSG;
+		memcpy(sftl->footer + i * SFTL_CHUNK, sftl->page, APPLE_PPN_PAGE_SIZE);
+	}
+	for (i = 0; i < chunks * SFTL_CHUNK; i += SFTL_META) {
+		const u8 *entry = sftl->footer + i;
+		u32 relative = get_unaligned_le32(entry), high = get_unaligned_le32(entry + 4);
+		u32 key = get_unaligned_le32(entry + 8), length = get_unaligned_le32(entry + 12);
+		u32 j;
+
+		if (!length) {
+			if (position != capacity - chunks)
+				return -EBADMSG;
+			victim->last_sequence = base + span - 1;
+			victim->footer_chunks = chunks;
+			return 0;
+		}
+		if ((!position && relative) || relative < previous_end || relative >= span ||
+		    length > span - relative || length > capacity - chunks - position)
+			return -EBADMSG;
+		if (key >= SFTL_LPAGES || length > SFTL_LPAGES - key)
+			return -EOPNOTSUPP;
+		/* Some native runs cross a high-word boundary with the initial
+		 * high word in the footer. Their per-chunk semantics are unverified.
+		 */
+		if (high == (base + relative) >> 16 &&
+		    high != (base + relative + length - 1) >> 16)
+			return -EOPNOTSUPP;
+		for (j = 0; j < length; j++, position++) {
+			u64 seq = base + relative + j;
+			const u8 *meta;
+
+			if (!(position % 4)) {
+				if (time_after_eq(jiffies, deadline))
+					return -ETIMEDOUT;
+				ret = sftl_read_address(sftl, first + position, &chunk);
+				if (ret)
+					return ret;
+			}
+			meta = sftl->oob + (position % 4) * SFTL_META;
+			/* Recognized native classes outside this operation are ineligible. */
+			if ((meta[0] == 2 && !meta[1]) ||
+			    (relocate && meta[0] == 1 && meta[1] == 1))
+				return -EOPNOTSUPP;
+			if (meta[0] != 1 || meta[1] > 1 ||
+			    sftl_sequence(meta) != seq || high != seq >> 16 ||
+			    get_unaligned_le32(meta + 8) != key + j ||
+			    get_unaligned_le32(meta + 12) != high)
+				return -EBADMSG;
+		}
+		previous_end = relative + length;
+	}
+	return -EBADMSG;
+}
+
+static int sftl_block_blank(struct apple_sftl *sftl, u32 block, unsigned long deadline,
+			    bool *blank)
+{
+	u32 capacity = hweight16(sftl->lanes[block]) * 512, pos;
+	unsigned int chunk;
+	int ret;
+
+	*blank = false;
+	for (pos = 0; pos < capacity; pos += 4) {
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+		ret = sftl_read_address(sftl, block * SFTL_STRIDE + pos, &chunk);
+		if (ret)
+			return ret;
+		if (!sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE) ||
+		    !sftl_erased(sftl->oob, APPLE_PPN_OOB_SIZE))
+			return 0;
+	}
+	*blank = true;
+	return 0;
+}
+
+static bool sftl_closed_candidate(struct apple_sftl *sftl, u32 block)
+{
+	return sftl->checkpoint_start && test_bit(block, sftl->old_closed) &&
+		!test_bit(block, sftl->reserved) && !test_bit(block, sftl->vfl_reserved) &&
+		!test_bit(block, sftl->unknown_lane_flags);
+}
+
+static bool sftl_retired_candidate(struct apple_sftl *sftl, u32 block)
+{
+	return sftl_closed_candidate(sftl, block) && !test_bit(block, sftl->checkpoint_used);
+}
+
+static int sftl_erase_verified(struct apple_sftl *sftl, u32 block, unsigned long deadline)
+{
+	unsigned int lane;
+	bool blank;
+	int ret;
+
+	for (lane = 0; lane < SFTL_LANES; lane++) {
+		if (!(sftl->lanes[block] & BIT(lane)))
 			continue;
-		/* A checked or rejected candidate is never reused in this instance. */
-		__set_bit(block, sftl->used);
-		capacity = hweight16(sftl->lanes[block]) * 128 * 4;
-		for (position = 0; position < capacity; position += 4) {
-			if (time_after_eq(jiffies, deadline)) {
-				sftl->failed = true;
-				return -ETIMEDOUT;
-			}
-			ret = sftl_read_address(sftl, block * SFTL_STRIDE + position, &chunk);
-			if (ret) {
-				sftl->failed = true;
-				return ret;
-			}
-			if (!sftl_erased(sftl->page, APPLE_PPN_PAGE_SIZE) ||
-			    !sftl_erased(sftl->oob, APPLE_PPN_OOB_SIZE)) {
-				blank = false;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+		ret = sftl->ppn->ops->erase_block(sftl->ppn->priv, lane & 1, lane >> 1, block);
+		if (ret)
+			return ret;
+	}
+	ret = sftl_block_blank(sftl, block, deadline, &blank);
+	return ret ? ret : (blank ? 0 : -EBADMSG);
+}
+
+static int sftl_reclaim_retired(struct apple_sftl *sftl, u32 *claimed,
+				unsigned long deadline)
+{
+	struct apple_sftl_snapshot active = {}, saved = {};
+	struct apple_sftl *cold = NULL;
+	size_t active_bytes, cold_bytes;
+	u32 block;
+	int ret = -ENOSPC;
+
+	if (!sftl->ppn->ops->erase_block)
+		return -ENOSPC;
+	/* The top 32 physical blocks can contain native bootstrap members. */
+	for (block = 1; block < SFTL_BLOCKS - 32; block++) {
+		struct apple_sftl_gc_block victim = {
+			.block = block, .lanes = sftl->lanes[block], .closed = true,
+		};
+
+		if (test_bit(block, sftl->used) || !sftl_retired_candidate(sftl, block))
+			continue;
+		if (!cold) {
+			ret = apple_sftl_load(sftl->ppn, &cold);
+			if (ret)
+				break;
+			active_bytes = array_size(sftl->nr_runs, sizeof(*active.runs));
+			cold_bytes = array_size(cold->nr_runs, sizeof(*saved.runs));
+			if (active_bytes > SFTL_GC_MAP_BYTES || cold_bytes > SFTL_GC_MAP_BYTES) {
+				ret = -ENOMEM;
 				break;
 			}
+			active.runs = kvzalloc(active_bytes, GFP_KERNEL);
+			saved.runs = kvzalloc(cold_bytes, GFP_KERNEL);
+			if (!active.runs || !saved.runs) {
+				ret = -ENOMEM;
+				break;
+			}
+			sftl_copy_map(sftl, &active);
+			sftl_copy_map(cold, &saved);
 		}
-		if (!blank)
+		if (!sftl_retired_candidate(cold, block) ||
+		    cold->checkpoint_start != sftl->checkpoint_start ||
+		    cold->lanes[block] != victim.lanes) {
+			ret = -EBADMSG;
+			break;
+		}
+		ret = sftl_verify_closed(sftl, &victim, deadline, false);
+		if (!ret)
+			ret = apple_sftl_gc_plan_retired(&active, &saved, &victim,
+							  cold->checkpoint_start);
+		if (ret == -EOPNOTSUPP) {
+			ret = -ENOSPC;
 			continue;
-		sftl->append_block = block;
-		sftl->append_capacity = capacity - SFTL_FOOTER_CHUNKS;
-		sftl->append_position = 0;
-		sftl->append_base = sftl->sequence + 1;
-		sftl->footer_runs = 0;
-		memset(sftl->footer, 0, SFTL_FOOTER_BYTES);
-		return 0;
+		}
+		if (ret)
+			break;
+		__set_bit(block, sftl->used);
+		ret = sftl_erase_verified(sftl, block, deadline);
+		if (ret) {
+			/* Never reissue an ambiguous, possibly partial erase. */
+			sftl->failed = true;
+			break;
+		}
+		*claimed = block;
+		break;
+	}
+	kvfree(saved.runs);
+	kvfree(active.runs);
+	apple_sftl_free(cold);
+	return ret;
+}
+
+static int sftl_check_landing(struct apple_sftl *sftl, u32 block, unsigned long deadline)
+{
+	bool blank;
+	int ret;
+
+	if (!block || block >= SFTL_SUBBLOCKS || !sftl->lanes[block] ||
+	    test_bit(block, sftl->reserved) || test_bit(block, sftl->vfl_reserved) ||
+	    test_bit(block, sftl->checkpoint_used))
+		return -EBADMSG;
+	ret = sftl_block_blank(sftl, block, deadline, &blank);
+	return ret ? ret : (blank ? 0 : -EBADMSG);
+}
+
+static int sftl_take_blank(struct apple_sftl *sftl, u32 *out, unsigned long deadline)
+{
+	u32 block;
+	bool blank;
+	int ret;
+
+	while (sftl->next_candidate < SFTL_SUBBLOCKS) {
+		block = sftl->next_candidate++;
+		if (!test_bit(block, sftl->candidates) || test_bit(block, sftl->used) ||
+		    (sftl->checkpoint_ops && test_bit(block, sftl->checkpoint_used)) ||
+		    !sftl->lanes[block])
+			continue;
+		__set_bit(block, sftl->used);
+		ret = sftl_block_blank(sftl, block, deadline, &blank);
+		if (ret) {
+			sftl->failed = true;
+			return ret;
+		}
+		if (blank) {
+			*out = block;
+			return 0;
+		}
 	}
 	return -ENOSPC;
+}
+
+static void sftl_open_block(struct apple_sftl *sftl, u32 block)
+{
+	sftl->append_block = block;
+	sftl->append_capacity = hweight16(sftl->lanes[block]) * 512 - SFTL_FOOTER_CHUNKS;
+	sftl->append_position = 0;
+	sftl->append_base = sftl->sequence + 1;
+	sftl->footer_runs = 0;
+	memset(sftl->footer, 0, SFTL_FOOTER_BYTES);
 }
 
 static int sftl_program_address(struct apple_sftl *sftl, u32 address,
@@ -1147,14 +1416,315 @@ static void sftl_append_summary(struct apple_sftl *sftl, u64 sequence, u32 key)
 	put_unaligned_le32(1, entry + 12);
 }
 
+static int sftl_snapshot_locked(struct apple_sftl *sftl, size_t max_bytes,
+				struct apple_sftl_snapshot **out);
+
+struct sftl_move {
+	struct apple_sftl *sftl;
+	unsigned long deadline;
+};
+
+static int sftl_move_read(void *priv, u32 address, struct apple_sftl_gc_page *page)
+{
+	struct sftl_move *move = priv;
+	struct apple_sftl *sftl = move->sftl;
+	unsigned int chunk;
+	int ret;
+
+	if (time_after_eq(jiffies, move->deadline))
+		return -ETIMEDOUT;
+	ret = sftl_read_address(sftl, address, &chunk);
+	if (ret)
+		return ret;
+	memcpy(page->data, sftl->page, sizeof(page->data));
+	memcpy(page->oob, sftl->oob, sizeof(page->oob));
+	return 0;
+}
+
+static int sftl_move_program(void *priv, u32 address, const struct apple_sftl_gc_page *page)
+{
+	struct sftl_move *move = priv;
+	struct apple_sftl *sftl = move->sftl;
+	unsigned int chunk;
+	int ret;
+
+	if (time_after_eq(jiffies, move->deadline))
+		return -ETIMEDOUT;
+	if (address != sftl->append_block * SFTL_STRIDE + sftl->append_position ||
+	    sftl->append_position + 4 > sftl->append_capacity)
+		return -ERANGE;
+	ret = sftl_program_address(sftl, address, page->data, page->oob);
+	if (ret)
+		return ret;
+	for (chunk = 0; chunk < 4; chunk++) {
+		const u8 *meta = page->oob + chunk * SFTL_META;
+
+		sftl_append_summary(sftl, sftl_sequence(meta), get_unaligned_le32(meta + 8));
+	}
+	sftl->append_position += 4;
+	return 0;
+}
+
+static const struct apple_sftl_gc_io sftl_move_ops = {
+	.read = sftl_move_read,
+	.program = sftl_move_program,
+};
+
+/* Adopt the state independently decoded from media; keep the landing block's
+ * verified summary and cursor so subsequent writes can use its free tail.
+ */
+static void sftl_adopt_checkpoint(struct apple_sftl *sftl, struct apple_sftl *cold)
+{
+	struct rb_root old_runs = sftl->runs;
+	struct sftl_records old_context = sftl->context;
+	u32 block;
+
+	sftl->runs = cold->runs;
+	cold->runs = old_runs;
+	sftl->nr_runs = cold->nr_runs;
+	sftl->context = cold->context;
+	cold->context = old_context;
+	sftl->sequence = cold->sequence;
+	sftl->journal_sequence = cold->journal_sequence;
+	sftl->checkpoint_sequence = cold->checkpoint_sequence;
+	sftl->checkpoint_start = cold->checkpoint_start;
+	memcpy(sftl->reserved, cold->reserved, sizeof(sftl->reserved));
+	memcpy(sftl->vfl_reserved, cold->vfl_reserved, sizeof(sftl->vfl_reserved));
+	memcpy(sftl->checkpoint_used, cold->checkpoint_used, sizeof(sftl->checkpoint_used));
+	memcpy(sftl->old_closed, cold->old_closed, sizeof(sftl->old_closed));
+	memcpy(sftl->unknown_lane_flags, cold->unknown_lane_flags, sizeof(sftl->unknown_lane_flags));
+	for (block = 0; block < SFTL_BLOCKS; block++)
+		if (test_bit(block, sftl->reserved) || test_bit(block, sftl->vfl_reserved) ||
+		    test_bit(block, sftl->checkpoint_used))
+			__set_bit(block, sftl->used);
+}
+
+static int sftl_compact(struct apple_sftl *sftl, u32 landing, unsigned long deadline)
+{
+	struct apple_sftl_gc_block destination = {
+		.block = landing, .lanes = sftl->lanes[landing], .blank = true,
+	};
+	struct sftl_move move = { .sftl = sftl, .deadline = deadline };
+	struct apple_sftl_checkpoint *image = NULL, *readback = NULL;
+	struct apple_sftl_snapshot *before = NULL, *after = NULL;
+	struct apple_sftl_gc *gc = NULL;
+	struct apple_sftl *cold = NULL;
+	u32 blocks[SFTL_MAX_CONTEXTS], nr = ARRAY_SIZE(blocks), block, slots, i;
+	int ret = -ENOSPC;
+
+	for (block = 1; block < SFTL_BLOCKS - 32; block++) {
+		struct apple_sftl_gc_block victim = {
+			.block = block, .lanes = sftl->lanes[block], .closed = true,
+		};
+
+		if (!sftl_closed_candidate(sftl, block) || !test_bit(block, sftl->checkpoint_used))
+			continue;
+		if (!before) {
+			ret = sftl_snapshot_locked(sftl, SFTL_GC_MAP_BYTES, &before);
+			if (ret)
+				goto out;
+		}
+		ret = sftl_verify_closed(sftl, &victim, deadline, true);
+		if (ret == -EOPNOTSUPP) {
+			ret = -ENOSPC;
+			continue;
+		}
+		if (ret)
+			goto out;
+		ret = apple_sftl_gc_plan(before, &victim, &destination, SFTL_MAX_CONTEXTS * SFTL_STRIDE,
+					 SFTL_GC_MAP_BYTES, &gc);
+		if (ret == -ENOSPC || ret == -EOVERFLOW) {
+			ret = -ENOSPC;
+			continue;
+		}
+		if (ret)
+			goto out;
+		slots = apple_sftl_gc_copy_chunks(gc);
+		/* Keep at least a page for this request, and gain usable capacity. */
+		if (!slots || !apple_sftl_gc_has_sequence_room(gc, 4) ||
+		    slots + 4 > hweight16(destination.lanes) * 512 - SFTL_FOOTER_CHUNKS ||
+		    slots >= hweight16(victim.lanes) * 512 - SFTL_FOOTER_CHUNKS) {
+			apple_sftl_gc_free(gc);
+			gc = NULL;
+			ret = -ENOSPC;
+			continue;
+		}
+		ret = sftl->checkpoint_ops->reserve(sftl->checkpoint_priv, blocks, &nr);
+		if (ret)
+			goto out;
+		if (!nr || nr > ARRAY_SIZE(blocks)) {
+			ret = -EINVAL;
+			goto out;
+		}
+		for (i = 0; i < nr; i++) {
+			u32 k;
+
+			if (!blocks[i] || blocks[i] >= SFTL_SUBBLOCKS || blocks[i] == block ||
+			    blocks[i] == landing || !test_bit(blocks[i], sftl->reserved)) {
+				ret = -EINVAL;
+				goto out;
+			}
+			for (k = 0; k < i; k++)
+				if (blocks[k] == blocks[i]) {
+					ret = -EINVAL;
+					goto out;
+				}
+		}
+		ret = sftl_check_landing(sftl, landing, deadline);
+		if (ret)
+			goto failed;
+		sftl_open_block(sftl, landing);
+		ret = apple_sftl_gc_relocate(gc, &sftl_move_ops, &move);
+		if (ret) {
+			if (apple_sftl_gc_stage(gc) == APPLE_SFTL_GC_COPY) {
+				/* The executor could not start. No page was programmed. */
+				sftl->append_block = U32_MAX;
+				goto out;
+			}
+			goto failed;
+		}
+		ret = apple_sftl_gc_checkpoint(gc, blocks, nr, &image);
+		if (ret)
+			goto failed;
+		ret = sftl->checkpoint_ops->install(sftl->checkpoint_priv, image, &readback);
+		if (readback == image) {
+			readback = NULL;
+			ret = -EBADMSG;
+		} else if (readback && readback->records == image->records) {
+			readback->records = NULL;
+			ret = -EBADMSG;
+		}
+		if (ret)
+			goto failed;
+		ret = apple_sftl_gc_checkpoint_done(gc, readback);
+		if (ret)
+			goto failed;
+		ret = apple_sftl_load(sftl->ppn, &cold);
+		if (ret)
+			goto failed;
+		ret = sftl_snapshot_locked(cold, SFTL_GC_MAP_BYTES, &after);
+		if (ret)
+			goto failed;
+		ret = apple_sftl_gc_recovered(gc, after);
+		if (ret)
+			goto failed;
+		if (!sftl_retired_candidate(cold, block) || test_bit(landing, cold->unknown_lane_flags) ||
+		    test_bit(landing, cold->reserved) || test_bit(landing, cold->vfl_reserved) ||
+		    memcmp(sftl->lanes, cold->lanes, sizeof(sftl->lanes))) {
+			ret = -EBADMSG;
+			goto failed;
+		}
+		ret = sftl_erase_verified(sftl, block, deadline);
+		if (ret)
+			goto failed;
+		sftl_adopt_checkpoint(sftl, cold);
+		sftl->spare = block;
+		goto out;
+	}
+	goto out;
+failed:
+	sftl->failed = true;
+out:
+	apple_sftl_free(cold);
+	apple_sftl_snapshot_free(after);
+	apple_sftl_snapshot_free(before);
+	apple_sftl_checkpoint_free(readback);
+	apple_sftl_checkpoint_free(image);
+	apple_sftl_gc_free(gc);
+	return ret;
+}
+
+static bool sftl_can_compact(struct apple_sftl *sftl)
+{
+	u32 block;
+
+	if (!sftl->checkpoint_ops || !sftl->ppn->ops->erase_block)
+		return false;
+	for (block = 1; block < SFTL_BLOCKS - 32; block++)
+		if (sftl_closed_candidate(sftl, block) && test_bit(block, sftl->checkpoint_used))
+			return true;
+	return false;
+}
+
+static int sftl_claim_block(struct apple_sftl *sftl)
+{
+	unsigned long deadline = jiffies + SFTL_CLAIM_TIMEOUT;
+	u32 block, spare;
+	int ret;
+
+	if (sftl->spare != U32_MAX) {
+		block = sftl->spare;
+		sftl->spare = U32_MAX;
+		ret = sftl_check_landing(sftl, block, deadline);
+		if (ret) {
+			sftl->failed = true;
+			return ret;
+		}
+	} else {
+		ret = sftl_take_blank(sftl, &block, deadline);
+		if (ret == -ENOSPC && !sftl->failed)
+			ret = sftl_reclaim_retired(sftl, &block, deadline);
+		if (ret)
+			return ret;
+	}
+	/* Only reserve landing space when a complete commit backend exists. */
+	if (!test_bit(block, sftl->unknown_lane_flags) && sftl_can_compact(sftl)) {
+		ret = sftl_take_blank(sftl, &spare, deadline);
+		if (!ret)
+			sftl->spare = spare;
+		else if (ret == -ENOSPC && !sftl->failed) {
+			/* Use already-retired space ahead of copying live records.
+			 * Keep the checked landing available for a later transaction.
+			 */
+			ret = sftl_reclaim_retired(sftl, &spare, deadline);
+			if (!ret) {
+				sftl->spare = block;
+				sftl_open_block(sftl, spare);
+				return 0;
+			}
+			if (ret != -ENOSPC || sftl->failed) {
+				if (!sftl->failed)
+					sftl->spare = block;
+				return ret;
+			}
+			ret = sftl_compact(sftl, block, deadline);
+			if (!ret || sftl->failed)
+				return ret;
+			if (ret != -ENOSPC && ret != -EOPNOTSUPP) {
+				sftl->spare = block;
+				return ret;
+			}
+		} else {
+			if (!sftl->failed)
+				sftl->spare = block;
+			return ret;
+		}
+	}
+	sftl_open_block(sftl, block);
+	return 0;
+}
+
+void apple_sftl_set_checkpoint_ops(struct apple_sftl *sftl,
+				   const struct apple_sftl_checkpoint_ops *ops, void *priv)
+{
+	mutex_lock(&sftl->lock);
+	sftl->checkpoint_ops = ops && ops->reserve && ops->install ? ops : NULL;
+	sftl->checkpoint_priv = priv;
+	mutex_unlock(&sftl->lock);
+}
+EXPORT_SYMBOL_GPL(apple_sftl_set_checkpoint_ops);
+
 static int sftl_close_block(struct apple_sftl *sftl)
 {
+	u64 span = sftl->sequence - sftl->append_base + 1;
 	u8 meta[SFTL_META];
 	unsigned int chunk, index;
 	int ret;
 
+	if (!span || span > U32_MAX)
+		return -EOVERFLOW;
 	put_unaligned_le64(sftl->append_base << 16 | 0x401c, meta);
-	put_unaligned_le32(sftl->append_position, meta + 8);
+	put_unaligned_le32(span, meta + 8);
 	put_unaligned_le16(SFTL_FOOTER_CHUNKS, meta + 12);
 	put_unaligned_le16(0xffff, meta + 14);
 	for (chunk = 0; chunk < 4; chunk++)
@@ -1200,6 +1770,10 @@ int apple_sftl_write(struct apple_sftl *sftl, u32 logical_page,
 		ret = sftl_claim_block(sftl);
 		if (ret)
 			goto out;
+	}
+	if (sftl->sequence > SFTL_SEQUENCE - 4) {
+		ret = -EOVERFLOW;
+		goto out;
 	}
 	address = sftl->append_block * SFTL_STRIDE + sftl->append_position;
 	first_sequence = sftl->sequence + 1;
@@ -1264,11 +1838,10 @@ void apple_sftl_get_info(struct apple_sftl *sftl, struct apple_sftl_info *info)
 }
 EXPORT_SYMBOL_GPL(apple_sftl_get_info);
 
-int apple_sftl_snapshot(struct apple_sftl *sftl, size_t max_bytes,
+static int sftl_snapshot_locked(struct apple_sftl *sftl, size_t max_bytes,
 			struct apple_sftl_snapshot **out)
 {
 	struct apple_sftl_snapshot *snapshot;
-	struct rb_node *node;
 	size_t map_bytes, context_bytes;
 	u32 i = 0;
 	unsigned int chunk;
@@ -1279,7 +1852,6 @@ int apple_sftl_snapshot(struct apple_sftl *sftl, size_t max_bytes,
 	*out = NULL;
 	if (!sftl)
 		return -EINVAL;
-	mutex_lock(&sftl->lock);
 	if (sftl->failed) {
 		ret = -EIO;
 		goto unlock;
@@ -1301,14 +1873,7 @@ int apple_sftl_snapshot(struct apple_sftl *sftl, size_t max_bytes,
 		ret = -ENOMEM;
 		goto failed;
 	}
-	for (node = rb_first(&sftl->runs); node; node = rb_next(node)) {
-		const struct sftl_run *run = rb_entry(node, struct sftl_run, node);
-
-		snapshot->runs[i++] = (struct apple_sftl_extent) {
-			.logical = run->start, .length = run->end - run->start,
-			.provider = run->provider,
-		};
-	}
+	sftl_copy_map(sftl, snapshot);
 	for (i = 0; i < sftl->context.count; i++) {
 		const struct sftl_record *reference = &sftl->context.items[i];
 		struct apple_sftl_context_record *record = &snapshot->opaque[i];
@@ -1326,16 +1891,26 @@ int apple_sftl_snapshot(struct apple_sftl *sftl, size_t max_bytes,
 		memcpy(record->meta, sftl->oob + chunk * SFTL_META, SFTL_META);
 		memcpy(record->data, sftl->page + chunk * SFTL_CHUNK, SFTL_CHUNK);
 	}
-	snapshot->nr_runs = sftl->nr_runs;
 	snapshot->nr_opaque = sftl->context.count;
-	snapshot->sequence = sftl->sequence;
-	snapshot->journal_sequence = sftl->journal_sequence;
-	snapshot->checkpoint_sequence = sftl->checkpoint_sequence;
 	*out = snapshot;
 	goto unlock;
 failed:
 	apple_sftl_snapshot_free(snapshot);
 unlock:
+	return ret;
+}
+int apple_sftl_snapshot(struct apple_sftl *sftl, size_t max_bytes,
+			struct apple_sftl_snapshot **out)
+{
+	int ret;
+
+	if (!sftl || !out) {
+		if (out)
+			*out = NULL;
+		return -EINVAL;
+	}
+	mutex_lock(&sftl->lock);
+	ret = sftl_snapshot_locked(sftl, max_bytes, out);
 	mutex_unlock(&sftl->lock);
 	return ret;
 }

@@ -390,6 +390,15 @@ u32 apple_sftl_gc_copy_chunks(const struct apple_sftl_gc *gc)
 	return gc->snapshot.sequence - gc->copied_sequence;
 }
 
+bool apple_sftl_gc_has_sequence_room(const struct apple_sftl_gc *gc, u32 pending)
+{
+	u32 count;
+
+	if (!gc || sftl_checkpoint_count(&gc->snapshot, gc->max_records, &count))
+		return false;
+	return pending <= SFTL_SEQUENCE - gc->snapshot.sequence - count;
+}
+
 const struct apple_sftl_gc_copy *apple_sftl_gc_next_copy(const struct apple_sftl_gc *gc)
 {
 	if (!gc || gc->stage != APPLE_SFTL_GC_COPY)
